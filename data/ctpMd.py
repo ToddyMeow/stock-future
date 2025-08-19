@@ -1,5 +1,6 @@
 """
 CTP行情接口
+last updated at Aug. 19, 2025
 """
 
 class CTPMdApi:
