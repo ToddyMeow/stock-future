@@ -212,3 +212,4 @@ __marimo__/
 __init__.py
 *.json
 *.ipynb
+.conda/*

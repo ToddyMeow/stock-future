@@ -46,7 +46,7 @@ def load_config() -> dict:
     return default_config
 
 
-def get_tickers_from_config(top_n: int = 15) -> list[str]:
+def get_tickers_from_config(top_n: int = 10) -> list[str]:
     """从配置文件获取成分股"""
     config = load_config()
     tickers = config.get("nasdaq100_top", DEFAULT_NASDAQ100_TOP)
@@ -58,6 +58,7 @@ def fetch_ohlcv_tiingo(
     api_key: str,
     start_date: str,
     end_date: str = None,
+    interval: str = "daily",
     delay: float = 0.5,
 ) -> pd.DataFrame:
     """
@@ -68,6 +69,9 @@ def fetch_ohlcv_tiingo(
         api_key: Tiingo API key
         start_date: 开始日期 (YYYY-MM-DD)
         end_date: 结束日期，默认今天
+        interval: 时间周期
+            - "daily": 日线（默认）
+            - "1hour", "30min", "15min", "5min", "1min": 日内数据
         delay: 请求间隔秒数
     
     Returns:
@@ -76,7 +80,14 @@ def fetch_ohlcv_tiingo(
     end_date = end_date or datetime.now().strftime("%Y-%m-%d")
     
     headers = {"Content-Type": "application/json", "Authorization": f"Token {api_key}"}
-    base_url = "https://api.tiingo.com/tiingo/daily/{}/prices"
+    
+    # 根据 interval 选择 API 端点
+    is_intraday = interval.lower() != "daily"
+    
+    if is_intraday:
+        base_url = "https://api.tiingo.com/iex/{}/prices"
+    else:
+        base_url = "https://api.tiingo.com/tiingo/daily/{}/prices"
     
     all_data = []
     failed = []
@@ -90,6 +101,10 @@ def fetch_ohlcv_tiingo(
         try:
             url = base_url.format(ticker)
             params = {"startDate": start_date, "endDate": end_date}
+            
+            if is_intraday:
+                params["resampleFreq"] = interval
+            
             resp = requests.get(url, headers=headers, params=params, timeout=30)
             
             if resp.status_code == 404:
@@ -106,11 +121,33 @@ def fetch_ohlcv_tiingo(
                 continue
             
             df = pd.DataFrame(data)
-            # 只保留复权价格列，避免重复
-            df = df[["date", "adjOpen", "adjHigh", "adjLow", "adjClose", "adjVolume"]]
-            df.columns = ["date", "open", "high", "low", "close", "volume"]
+            
+            # 日内和日线数据列名不同
+            if is_intraday:
+                # IEX 返回格式可能不同，先检查
+                available_cols = df.columns.tolist()
+                print(f"    可用列: {available_cols}")
+                
+                # 标准化列名映射
+                rename_map = {}
+                target_cols = []
+                
+                for std_name in ["date", "open", "high", "low", "close", "volume"]:
+                    if std_name in available_cols:
+                        target_cols.append(std_name)
+                
+                # 只保留存在的列
+                df = df[[c for c in ["date", "open", "high", "low", "close", "volume"] if c in available_cols]]
+                
+                # 如果没有 volume，添加空列
+                if "volume" not in df.columns:
+                    df["volume"] = 0
+            else:
+                df = df[["date", "adjOpen", "adjHigh", "adjLow", "adjClose", "adjVolume"]]
+                df.columns = ["date", "open", "high", "low", "close", "volume"]
+            
             df["ticker"] = ticker
-            df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
+            df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d %H:%M:%S" if is_intraday else "%Y-%m-%d")
             
             all_data.append(df)
             print(f"  成功: {len(df)} 条记录")
@@ -154,10 +191,11 @@ def save_to_sqlite(df: pd.DataFrame, db_path: str, table_name: str = "ohlcv"):
 def main(
     tickers: list[str] = None,
     include_qqq: bool = True,
-    top_n: int = 16,
+    top_n: int = 10,
     years: int = None,
     db_path: str = None,
     api_key: str = None,
+    interval: str = None,
 ):
     """
     主函数
@@ -169,6 +207,7 @@ def main(
         years: 获取多少年的数据（None则从配置读取）
         db_path: SQLite 数据库路径（None则从配置读取）
         api_key: Tiingo API key（None则从配置读取）
+        interval: 时间周期 (daily/1hour/30min/15min/5min/1min)
     """
     config = load_config()
     
@@ -176,6 +215,7 @@ def main(
     years = years or config.get("years", 10)
     db_path = db_path or config.get("db_path", "stock_data.db")
     api_key = api_key or config.get("tiingo_api_key")
+    interval = interval or config.get("interval", "daily")
     
     if not api_key:
         raise ValueError("需要 Tiingo API key，请在 config.json 中设置 tiingo_api_key")
@@ -189,17 +229,24 @@ def main(
     if include_qqq:
         tickers = ["QQQ"] + [t for t in tickers if t != "QQQ"]
     
-    # 计算日期范围
+    # 计算日期范围（日内数据限制历史较短）
     end_date = datetime.now()
-    start_date = end_date - timedelta(days=years * 365)
+    if interval.lower() != "daily":
+        # 日内数据从 2016 年开始，且免费版可能有更多限制
+        max_days = min(years * 365, 30)  # 日内数据默认取最近30天
+        start_date = end_date - timedelta(days=max_days)
+        print(f"注意: 日内数据取最近 {max_days} 天")
+    else:
+        start_date = end_date - timedelta(days=years * 365)
     
     # 获取数据
-    print(f"\n获取 {start_date.strftime('%Y-%m-%d')} 到 {end_date.strftime('%Y-%m-%d')} 的数据...")
+    print(f"\n获取 {start_date.strftime('%Y-%m-%d')} 到 {end_date.strftime('%Y-%m-%d')} 的 {interval} 数据...")
     df = fetch_ohlcv_tiingo(
         tickers=tickers,
         api_key=api_key,
         start_date=start_date.strftime("%Y-%m-%d"),
         end_date=end_date.strftime("%Y-%m-%d"),
+        interval=interval,
     )
     
     # 保存到数据库

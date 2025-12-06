@@ -9,14 +9,23 @@ import numpy as np
 import vectorbt as vbt
 
 
-def load_data(db_path: str, ticker: str) -> pd.DataFrame:
-    """从数据库加载数据"""
+def load_data(db_path: str, ticker: str, start_date: str = None, end_date: str = None) -> pd.DataFrame:
+    """从数据库加载数据，支持日期过滤"""
     conn = sqlite3.connect(db_path)
-    df = pd.read_sql(
-        "SELECT * FROM ohlcv WHERE ticker = ? ORDER BY date",
-        conn,
-        params=(ticker,),
-    )
+    
+    query = "SELECT * FROM ohlcv WHERE ticker = ?"
+    params = [ticker]
+    
+    if start_date:
+        query += " AND date >= ?"
+        params.append(start_date)
+    if end_date:
+        query += " AND date <= ?"
+        params.append(end_date)
+    
+    query += " ORDER BY date"
+    
+    df = pd.read_sql(query, conn, params=params)
     conn.close()
     df["date"] = pd.to_datetime(df["date"])
     df = df.set_index("date")
@@ -34,10 +43,10 @@ def calc_atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14
 
 def run_backtest(
     df: pd.DataFrame,
-    ma_fast: int = 20,
-    ma_slow: int = 60,
-    atr_period: int = 14,
-    atr_multiplier: float = 2.0,
+    ma_fast: int = 15,
+    ma_slow: int = 30,
+    atr_period: int = 7,
+    atr_multiplier: float = 1.5,
     init_cash: float = 100000,
 ):
     """
@@ -128,6 +137,7 @@ def print_stats(pf, ticker: str):
     
     return stats
 
+
 def plot_equity_curve(pf, ticker: str, save_path: str = None):
     """绘制资金曲线"""
     import matplotlib.pyplot as plt
@@ -161,8 +171,23 @@ def plot_equity_curve(pf, ticker: str, save_path: str = None):
     return fig
 
 
-def main(db_path: str = "stock_data.db", tickers: list = None):
-    """主函数"""
+def main(
+    db_path: str = "stock_data.db",
+    tickers: list = None,
+    start_date: str = None,
+    end_date: str = None,
+    plot: bool = True,
+):
+    """
+    主函数
+    
+    Args:
+        db_path: 数据库路径
+        tickers: 股票列表
+        start_date: 开始日期 (YYYY-MM-DD)
+        end_date: 结束日期 (YYYY-MM-DD)
+        plot: 是否绘图
+    """
     if tickers is None:
         tickers = ["QQQ"]
     
@@ -170,8 +195,10 @@ def main(db_path: str = "stock_data.db", tickers: list = None):
     
     for ticker in tickers:
         print(f"\n回测 {ticker}...")
+        if start_date or end_date:
+            print(f"日期范围: {start_date or '最早'} ~ {end_date or '最新'}")
         
-        df = load_data(db_path, ticker)
+        df = load_data(db_path, ticker, start_date, end_date)
         if df.empty:
             print(f"  {ticker} 无数据")
             continue
@@ -179,14 +206,17 @@ def main(db_path: str = "stock_data.db", tickers: list = None):
         pf = run_backtest(df)
         stats = print_stats(pf, ticker)
         results[ticker] = {"portfolio": pf, "stats": stats}
-
-        plot_equity_curve(pf, ticker, f"equity_curve_{ticker}.png")
         
+        if plot:
+            plot_equity_curve(pf, ticker, save_path=f"{ticker}_equity.png")
+    
     return results
 
 
 if __name__ == "__main__":
-    results = main(tickers=["QQQ"])
-    
-    # 可视化（如果在 notebook 环境）
-    # results["QQQ"]["portfolio"].plot().show()
+    # 2025年数据回测
+    results = main(
+        tickers=["QQQ"],
+        start_date="2025-01-01",
+        end_date="2025-12-31",
+    )

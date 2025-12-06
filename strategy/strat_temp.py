@@ -39,8 +39,8 @@ def calc_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
 
 def run_backtest(
     df: pd.DataFrame,
-    ma_fast: int = 20,
-    ma_slow: int = 60,
+    ma_fast: int = 5,
+    ma_slow: int = 20,
     atr_period: int = 14,
     atr_multiplier: float = 2.0,
 ) -> pd.DataFrame:
