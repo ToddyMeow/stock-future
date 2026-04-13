@@ -213,3 +213,7 @@ __init__.py
 *.json
 *.ipynb
 .conda/*
+
+
+*.csv
+.DS_Store
