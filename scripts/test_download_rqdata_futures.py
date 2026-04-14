@@ -8,10 +8,23 @@ import pytest
 from scripts import download_rqdata_futures as downloader
 
 
+def make_instruments_df() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "order_book_id": ["CU2506", "CU2507", "IF2506", "ZZ2501"],
+            "underlying_symbol": ["CU", "CU", "IF", "ZZ"],
+            "exchange": ["SHFE", "SHFE", "CFFEX", "CZCE"],
+            "product": ["Commodity", "Commodity", "Index", "Commodity"],
+            "contract_multiplier": [5, 5, 300, 20],
+        }
+    )
+
+
 class DummyRQData:
     def __init__(self) -> None:
         self.init_calls = []
         self.get_price_calls = []
+        self.all_instruments_calls = []
 
     def init(self, user: str, password: str) -> None:
         self.init_calls.append((user, password))
@@ -30,6 +43,10 @@ class DummyRQData:
             },
             index=index,
         )
+
+    def all_instruments(self, **kwargs):
+        self.all_instruments_calls.append(kwargs)
+        return make_instruments_df()
 
 
 class DummyFutures:
@@ -56,7 +73,7 @@ def write_cfg(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
-def make_cfg(tmp_path: Path) -> str:
+def make_cfg(tmp_path: Path, *, auto_discover_underlyings: bool = False) -> str:
     out_dir = tmp_path / "raw"
     normalized_base = tmp_path / "normalized" / "hab_bars"
     return f"""
@@ -68,12 +85,23 @@ fields = open, high, low, close, volume, open_interest
 raw_output_dir = {out_dir}
 normalized_output_base = {normalized_base}
 write_csv = true
-write_parquet = true
+write_parquet = false
 overwrite = false
 
 [adapter]
 default_slippage_override =
 drop_zero_volume_rows = false
+
+[discovery]
+auto_discover_underlyings = {"true" if auto_discover_underlyings else "false"}
+date = 2026-01-01
+exchanges =
+include_underlyings =
+exclude_underlyings =
+kind = dominant
+variants = none, pre
+normalize = true
+normalize_variant = pre
 
 [job:contract]
 kind = contract
@@ -140,6 +168,34 @@ def test_load_config_reads_cfg(tmp_path: Path) -> None:
     assert config["raw_output_dir"] == str(tmp_path / "raw")
     assert config["normalized_output_base"] == str(tmp_path / "normalized" / "hab_bars")
     assert len(config["jobs"]) == 2
+    assert config["discovery"]["auto_discover_underlyings"] is False
+
+
+def test_load_config_allows_auto_discovery_without_explicit_jobs(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.cfg"
+    write_cfg(
+        config_path,
+        """
+[download]
+start_date = 2018-01-01
+end_date = 2026-01-01
+frequency = 1d
+fields = open, high, low, close, volume, open_interest
+
+[discovery]
+auto_discover_underlyings = true
+date = 2026-01-01
+kind = dominant
+variants = none, pre
+normalize = true
+normalize_variant = pre
+""".strip(),
+    )
+
+    config = downloader.load_config(config_path)
+
+    assert config["jobs"] == []
+    assert config["discovery"]["auto_discover_underlyings"] is True
 
 
 def test_load_config_rejects_missing_download_section(tmp_path: Path) -> None:
@@ -172,6 +228,47 @@ variants = none, bad
         downloader.load_config(config_path)
 
 
+def test_load_futures_instruments_uses_all_instruments(monkeypatch) -> None:
+    dummy = DummyRQData()
+    monkeypatch.setattr(downloader, "rqdatac", dummy)
+
+    instruments = downloader.load_futures_instruments("2026-01-01")
+
+    assert not instruments.empty
+    assert dummy.all_instruments_calls == [{"type": "Future", "date": "2026-01-01"}]
+
+
+def test_expand_jobs_adds_discovered_underlyings() -> None:
+    config = {
+        "jobs": [
+            {
+                "kind": "dominant",
+                "underlying_symbol": "CU",
+                "strategy_symbol": "CU",
+                "variants": ["none", "pre"],
+                "normalize": True,
+                "normalize_variant": "pre",
+            }
+        ],
+        "discovery": {
+            "auto_discover_underlyings": True,
+            "date": "2026-01-01",
+            "exchanges": [],
+            "include_underlyings": [],
+            "exclude_underlyings": [],
+            "kind": "dominant",
+            "variants": ["none", "pre"],
+            "normalize": True,
+            "normalize_variant": "pre",
+        },
+    }
+
+    jobs = downloader.expand_jobs(config, make_instruments_df())
+
+    job_symbols = {job["underlying_symbol"] for job in jobs}
+    assert job_symbols == {"CU", "IF", "ZZ"}
+
+
 def test_download_contract_job_calls_get_price_with_expected_params(
     monkeypatch, tmp_path: Path
 ) -> None:
@@ -188,10 +285,12 @@ def test_download_contract_job_calls_get_price_with_expected_params(
         overwrite=True,
         write_csv=True,
         write_parquet=True,
+        instruments_df=make_instruments_df(),
     )
 
     assert result.status == "ok"
     assert normalization_input is not None
+    assert normalization_input.symbol_spec.contract_multiplier == 5.0
     assert dummy.get_price_calls == [
         {
             "order_book_ids": "CU2506",
@@ -220,10 +319,12 @@ def test_download_dominant_job_calls_expected_variants(monkeypatch, tmp_path: Pa
         overwrite=True,
         write_csv=True,
         write_parquet=True,
+        instruments_df=make_instruments_df(),
     )
 
     assert result.status == "ok"
     assert normalization_input is not None
+    assert normalization_input.symbol_spec.contract_multiplier == 5.0
     assert dummy.calls == [
         {
             "underlying_symbols": "CU",
@@ -279,6 +380,62 @@ def test_write_outputs_skips_existing_files_without_overwrite(tmp_path: Path) ->
     assert base_path.with_suffix(".csv").read_text(encoding="utf-8") == "existing"
 
 
+def test_write_outputs_skips_parquet_when_engine_missing(monkeypatch, tmp_path: Path) -> None:
+    base_path = tmp_path / "contracts" / "CU2506"
+    df = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2025-01-02"]),
+            "open": [1.0],
+            "high": [1.1],
+            "low": [0.9],
+            "close": [1.05],
+            "volume": [10],
+            "open_interest": [100],
+        }
+    )
+
+    def raise_missing_parquet(*args, **kwargs):
+        raise ImportError("Missing optional dependency 'pyarrow'. pyarrow is required.")
+
+    monkeypatch.setattr(pd.DataFrame, "to_parquet", raise_missing_parquet)
+
+    details = downloader.write_outputs(
+        df=df,
+        base_path=base_path,
+        overwrite=True,
+        write_csv=True,
+        write_parquet=True,
+    )
+
+    assert (tmp_path / "contracts" / "CU2506.csv").exists()
+    assert any("skip parquet output" in detail for detail in details)
+
+
+def test_download_dominant_job_skips_when_rqdata_returns_none(monkeypatch, tmp_path: Path) -> None:
+    class NoneFutures:
+        def get_dominant_price(self, **kwargs):
+            return None
+
+    monkeypatch.setattr(downloader, "rqfutures", NoneFutures())
+
+    result, normalization_input = downloader.download_dominant_job(
+        {"kind": "dominant", "underlying_symbol": "ER", "variants": ["none", "pre"]},
+        start_date="2018-01-01",
+        end_date="2026-01-01",
+        frequency="1d",
+        fields=downloader.DEFAULT_FIELDS,
+        raw_output_dir=tmp_path,
+        overwrite=True,
+        write_csv=True,
+        write_parquet=False,
+        instruments_df=make_instruments_df(),
+    )
+
+    assert result.status == "skip"
+    assert normalization_input is None
+    assert any("no data returned" in detail for detail in result.details)
+
+
 def test_normalize_output_frame_resets_datetime_index() -> None:
     df = pd.DataFrame(
         {
@@ -298,6 +455,27 @@ def test_normalize_output_frame_resets_datetime_index() -> None:
     assert normalized.loc[0, "date"] == pd.Timestamp("2025-01-02")
 
 
+def test_normalize_output_frame_infers_date_from_non_datetime_index() -> None:
+    df = pd.DataFrame(
+        {
+            "dominant_id": ["CU2506"],
+            "open": [1.0],
+            "high": [1.1],
+            "low": [0.9],
+            "close": [1.05],
+            "volume": [10],
+            "open_interest": [100],
+        },
+        index=pd.Index(["2025-01-02"], name="trading_date"),
+    )
+
+    normalized = downloader.normalize_output_frame(df)
+
+    assert "date" in normalized.columns
+    assert "dominant_id" in normalized.columns
+    assert normalized.loc[0, "date"] == pd.Timestamp("2025-01-02")
+
+
 def test_build_normalized_dataset_uses_adapter_shape(tmp_path: Path) -> None:
     normalization_input = downloader.NormalizationInput(
         rq_df=pd.DataFrame(
@@ -309,12 +487,14 @@ def test_build_normalized_dataset_uses_adapter_shape(tmp_path: Path) -> None:
                 "close": [3.05],
                 "volume": [30],
                 "open_interest": [300],
+                "contract_multiplier": [5],
             }
         ),
         symbol_spec=downloader.RQSymbolSpec(
             rq_symbol="CU_dominant_pre",
             underlying_symbol="CU",
             strategy_symbol="CU",
+            contract_multiplier=5,
         ),
     )
 
@@ -359,12 +539,14 @@ def test_run_jobs_continues_after_failures(monkeypatch, tmp_path: Path) -> None:
                         "close": [3.05],
                         "volume": [30],
                         "open_interest": [300],
+                        "contract_multiplier": [5],
                     }
                 ),
                 symbol_spec=downloader.RQSymbolSpec(
                     rq_symbol="CU_dominant_pre",
                     underlying_symbol="CU",
                     strategy_symbol="CU",
+                    contract_multiplier=5,
                 ),
             ),
         )
@@ -372,7 +554,11 @@ def test_run_jobs_continues_after_failures(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(downloader, "download_contract_job", failing_contract_job)
     monkeypatch.setattr(downloader, "download_dominant_job", ok_dominant_job)
 
-    outcome = downloader.run_jobs(config=config, overwrite=False)
+    outcome = downloader.run_jobs(
+        config=config,
+        overwrite=False,
+        instruments_df=make_instruments_df(),
+    )
 
     assert len(outcome.results) == 2
     assert outcome.results[0].status == "error"
@@ -384,7 +570,7 @@ def test_main_builds_normalized_dataset_and_returns_zero(
     monkeypatch, tmp_path: Path, capsys
 ) -> None:
     config_path = tmp_path / "config.cfg"
-    write_cfg(config_path, make_cfg(tmp_path))
+    write_cfg(config_path, make_cfg(tmp_path, auto_discover_underlyings=True))
 
     dummy = DummyRQData()
     dummy_futures = DummyFutures()
@@ -398,4 +584,4 @@ def test_main_builds_normalized_dataset_and_returns_zero(
 
     assert exit_code == 0
     assert "[OK] normalized:hab_bars" in stdout
-    assert (tmp_path / "normalized" / "hab_bars.parquet").exists()
+    assert (tmp_path / "normalized" / "hab_bars.csv").exists()

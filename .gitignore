@@ -209,9 +209,11 @@ __marimo__/
 
 *.db
 *.png
-__init__.py
 *.json
 *.ipynb
+!note/hab_bars_first_month.ipynb
+!note/hab_backtest_analysis.ipynb
+!note/hab_symbol_scan.ipynb
 .conda/*
 
 

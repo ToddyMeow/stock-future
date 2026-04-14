@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
 
-import numpy as np
 import pandas as pd
 
 from data.adapters.futures_static_meta import get_meta
@@ -24,7 +23,7 @@ class RQSymbolSpec:
         - I2509
 
     underlying_symbol:
-        用于映射静态元数据的底层品种符号，例如:
+        用于映射本地交易成本和分组假设的底层品种符号，例如:
         - RB
         - I
         - M
@@ -34,9 +33,13 @@ class RQSymbolSpec:
         喂给 HAB v1 的稳定 symbol。
         研究阶段建议直接用 underlying_symbol
     """
+
     rq_symbol: str
     underlying_symbol: str
     strategy_symbol: str
+    exchange: Optional[str] = None
+    product: Optional[str] = None
+    contract_multiplier: Optional[float] = None
 
 
 class RQDataFuturesResearchAdapter:
@@ -81,12 +84,19 @@ class RQDataFuturesResearchAdapter:
         输入可以是：
         1. index 为 DatetimeIndex，columns 包含 open/high/low/close/volume/open_interest
         2. 普通 DataFrame，但必须能解析出 date 列
+
+        contract_multiplier 优先从输入数据中取；如果缺失，则回退到 symbol_spec。
         """
-        meta = get_meta(symbol_spec.underlying_symbol)
+        meta = get_meta(
+            symbol_spec.underlying_symbol,
+            exchange=symbol_spec.exchange,
+            product=symbol_spec.product,
+        )
         df = rq_df.copy()
 
         df = self._ensure_date_column(df)
         self._validate_columns(df)
+        multiplier_series = self._resolve_contract_multiplier(df, symbol_spec)
 
         out = pd.DataFrame(
             {
@@ -98,7 +108,7 @@ class RQDataFuturesResearchAdapter:
                 "close": pd.to_numeric(df["close"], errors="coerce"),
                 "volume": pd.to_numeric(df["volume"], errors="coerce"),
                 "open_interest": pd.to_numeric(df["open_interest"], errors="coerce"),
-                "contract_multiplier": float(meta.contract_multiplier),
+                "contract_multiplier": multiplier_series,
                 "commission": float(meta.commission),
                 "slippage": float(
                     self.default_slippage_override
@@ -167,10 +177,44 @@ class RQDataFuturesResearchAdapter:
                 f"RQData dataframe missing required columns: {sorted(missing)}"
             )
 
+    def _resolve_contract_multiplier(
+        self,
+        df: pd.DataFrame,
+        symbol_spec: RQSymbolSpec,
+    ) -> pd.Series:
+        if "contract_multiplier" in df.columns:
+            multiplier = pd.to_numeric(df["contract_multiplier"], errors="coerce")
+        elif symbol_spec.contract_multiplier is not None:
+            multiplier = pd.Series(float(symbol_spec.contract_multiplier), index=df.index)
+        else:
+            raise ValueError(
+                "Missing contract_multiplier in dataframe and symbol_spec for "
+                f"{symbol_spec.rq_symbol!r}"
+            )
+
+        multiplier = multiplier.ffill().bfill()
+        if multiplier.isna().any():
+            raise ValueError(
+                f"contract_multiplier contains missing values for {symbol_spec.rq_symbol!r}"
+            )
+        if (multiplier <= 0).any():
+            raise ValueError(
+                f"contract_multiplier must be positive for {symbol_spec.rq_symbol!r}"
+            )
+        return multiplier.astype(float)
+
     def _basic_clean(self, out: pd.DataFrame) -> pd.DataFrame:
         out = out.loc[out["date"].notna()].copy()
 
-        essential_cols = ["open", "high", "low", "close", "volume", "open_interest"]
+        essential_cols = [
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "open_interest",
+            "contract_multiplier",
+        ]
         out = out.dropna(subset=essential_cols).copy()
 
         out["volume"] = out["volume"].clip(lower=0.0)

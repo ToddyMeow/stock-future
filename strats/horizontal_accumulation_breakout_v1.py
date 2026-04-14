@@ -45,7 +45,7 @@ class HABConfig:
     portfolio_risk_cap: float = 0.12
     group_risk_cap: float = 0.06
 
-    structure_fail_bars: int = 3
+    structure_fail_bars: int = 15
     time_fail_bars: int = 5
     time_fail_target_r: float = 0.5
     trail_activate_r: float = 1.0
