@@ -59,8 +59,8 @@ class HABExitStrategy:
             # 3) Structure fail
             atr_now = float(row["atr"]) if pd.notna(row.get("atr")) else 0.0
             if position.completed_bars <= cfg.structure_fail_bars:
-                box_high = position.metadata.get("box_high", position.box_high) if hasattr(position, "metadata") else position.box_high
-                box_low = position.metadata.get("box_low", position.box_low) if hasattr(position, "metadata") else position.box_low
+                box_high = position.metadata.get("box_high", 0.0)
+                box_low = position.metadata.get("box_low", 0.0)
                 ref = box_high if d == 1 else box_low
                 mode = cfg.structure_fail_mode
                 buf = cfg.structure_fail_atr_buffer * atr_now
