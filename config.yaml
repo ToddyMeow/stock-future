@@ -1,6 +1,5 @@
 # ─────────────────────────────────────────────────────────────
 # Strategy Config — 所有策略超参数的唯一来源
-# 修改此文件即可调整引擎、入场、出场的全部参数
 # ─────────────────────────────────────────────────────────────
 
 # 数据路径
@@ -15,49 +14,63 @@ engine:
 
   # 风控
   risk_per_trade: 0.02
-  portfolio_risk_cap: 0.12
+  portfolio_risk_cap: 0.15
   group_risk_cap: 0.06
   max_portfolio_leverage: 3.0
   default_margin_rate: 0.10
 
+  # 回撤熔断
+  max_drawdown_halt: 0.15    # 触发：-15%
+  drawdown_resume: 0.10      # 解除：-10%
+
   # 填充机制
   risk_blowout_cap: 1.5
-  risk_blowout_action: "SHRINK"   # SHRINK / CANCEL
-  allow_short: true
+  risk_blowout_action: "SHRINK"
+  allow_short: false
 
-# ── 入场策略（选一个） ─────────────────────────────────────
-# 取消注释你想使用的入场策略，注释掉其它的
+# ── 策略组合 ──────────────────────────────────────────────
+# 每个 strategy 是一个入场+出场配对，共享引擎资金池
+strategies:
+  - id: "hab"
+    entry:
+      type: "hab"
+      hab:
+        bb_period: 20
+        bb_std: 2.0
+        bb_percentile_lookback: 60
+        bb_percentile_threshold: 0.30
+        box_lookback: 7
+        box_width_atr_mult: 1.5
+        tol_atr_mult: 0.25
+        breakout_atr_mult: 0.5
+        upper_shadow_ratio_max: 0.25
+        initial_stop_atr_mult: 1
+    exit:
+      type: "hab"
+      hab:
+        structure_fail_bars: 15
+        structure_fail_mode: "CLOSE_BELOW_BOX_MINUS_ATR"
+        structure_fail_atr_buffer: 0.5
+        structure_fail_consecutive: 2
+        time_fail_bars: 15
+        time_fail_target_r: 0.3
+        trail_activate_r: 1.0
+        trail_atr_mult: 2.0
 
-entry:
-  strategy: "hab"   # hab / donchian
-
-  hab:
-    bb_period: 20
-    bb_std: 2.0
-    bb_percentile_lookback: 60
-    bb_percentile_threshold: 0.30
-    box_lookback: 7
-    box_width_atr_mult: 1.5
-    tol_atr_mult: 0.25
-    breakout_atr_mult: 0.5
-    upper_shadow_ratio_max: 0.25
-    initial_stop_atr_mult: 0.4
-
-  donchian:
-    donchian_period: 20
-    initial_stop_atr_mult: 2.0
-
-# ── 出场策略（选一个） ─────────────────────────────────────
-
-exit:
-  strategy: "hab"   # hab
-
-  hab:
-    structure_fail_bars: 15
-    structure_fail_mode: "CLOSE_BELOW_BOX"   # CLOSE_BELOW_BOX / CLOSE_BELOW_BOX_MINUS_ATR / CONSECUTIVE_CLOSE
-    structure_fail_atr_buffer: 0.5
-    structure_fail_consecutive: 2
-    time_fail_bars: 5
-    time_fail_target_r: 0.5
-    trail_activate_r: 1.0
-    trail_atr_mult: 2.0
+  - id: "donchian"
+    entry:
+      type: "donchian"
+      donchian:
+        donchian_period: 20
+        initial_stop_atr_mult: 2.0
+    exit:
+      type: "hab"
+      hab:
+        structure_fail_bars: 15
+        structure_fail_mode: "CLOSE_BELOW_BOX_MINUS_ATR"
+        structure_fail_atr_buffer: 0.5
+        structure_fail_consecutive: 2
+        time_fail_bars: 15
+        time_fail_target_r: 0.3
+        trail_activate_r: 1.0
+        trail_atr_mult: 2.0

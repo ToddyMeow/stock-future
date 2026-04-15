@@ -11,11 +11,11 @@ Usage:
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import yaml
 
-from strats.engine import EngineConfig, StrategyEngine
+from strats.engine import EngineConfig, StrategyEngine, StrategySlot
 from strats.entries.donchian_entry import DonchianEntryConfig, DonchianEntryStrategy
 from strats.entries.hab_entry import HABEntryConfig, HABEntryStrategy
 from strats.exits.hab_exit import HABExitConfig, HABExitStrategy
@@ -24,7 +24,6 @@ from strats.exits.hab_exit import HABExitConfig, HABExitStrategy
 def load_config(path: Optional[str] = None) -> Dict[str, Any]:
     """Load config.yaml and return as a plain dict."""
     if path is None:
-        # Walk up from this file to find repo root
         root = Path(__file__).resolve().parent.parent
         path = str(root / "config.yaml")
     with open(path, "r", encoding="utf-8") as f:
@@ -45,16 +44,17 @@ def build_engine_config(cfg: Dict[str, Any]) -> EngineConfig:
         risk_blowout_cap=float(e.get("risk_blowout_cap", 1.5)),
         risk_blowout_action=e.get("risk_blowout_action", "SHRINK"),
         allow_short=bool(e.get("allow_short", False)),
+        max_drawdown_halt=float(e.get("max_drawdown_halt", 1.0)),
+        drawdown_resume=float(e.get("drawdown_resume", 0.05)),
     )
 
 
-def _build_entry_strategy(cfg: Dict[str, Any], allow_short: bool) -> Any:
-    """Build the selected entry strategy from the 'entry' section."""
-    entry = cfg.get("entry", {})
-    strategy_name = entry.get("strategy", "hab").lower()
+def _build_entry(entry_cfg: Dict[str, Any], allow_short: bool) -> Any:
+    """Build an entry strategy from a config dict."""
+    entry_type = entry_cfg.get("type", "hab").lower()
 
-    if strategy_name == "hab":
-        p = entry.get("hab", {})
+    if entry_type == "hab":
+        p = entry_cfg.get("hab", {})
         return HABEntryStrategy(HABEntryConfig(
             bb_period=int(p.get("bb_period", 20)),
             bb_std=float(p.get("bb_std", 2.0)),
@@ -68,26 +68,23 @@ def _build_entry_strategy(cfg: Dict[str, Any], allow_short: bool) -> Any:
             initial_stop_atr_mult=float(p.get("initial_stop_atr_mult", 0.4)),
             allow_short=allow_short,
         ))
-
-    elif strategy_name == "donchian":
-        p = entry.get("donchian", {})
+    elif entry_type == "donchian":
+        p = entry_cfg.get("donchian", {})
         return DonchianEntryStrategy(DonchianEntryConfig(
             donchian_period=int(p.get("donchian_period", 20)),
             initial_stop_atr_mult=float(p.get("initial_stop_atr_mult", 2.0)),
             allow_short=allow_short,
         ))
-
     else:
-        raise ValueError(f"Unknown entry strategy: {strategy_name!r}. Use 'hab' or 'donchian'.")
+        raise ValueError(f"Unknown entry type: {entry_type!r}")
 
 
-def _build_exit_strategy(cfg: Dict[str, Any]) -> Any:
-    """Build the selected exit strategy from the 'exit' section."""
-    exit_sec = cfg.get("exit", {})
-    strategy_name = exit_sec.get("strategy", "hab").lower()
+def _build_exit(exit_cfg: Dict[str, Any]) -> Any:
+    """Build an exit strategy from a config dict."""
+    exit_type = exit_cfg.get("type", "hab").lower()
 
-    if strategy_name == "hab":
-        p = exit_sec.get("hab", {})
+    if exit_type == "hab":
+        p = exit_cfg.get("hab", {})
         return HABExitStrategy(HABExitConfig(
             structure_fail_bars=int(p.get("structure_fail_bars", 15)),
             structure_fail_mode=p.get("structure_fail_mode", "CLOSE_BELOW_BOX"),
@@ -98,28 +95,46 @@ def _build_exit_strategy(cfg: Dict[str, Any]) -> Any:
             trail_activate_r=float(p.get("trail_activate_r", 1.0)),
             trail_atr_mult=float(p.get("trail_atr_mult", 2.0)),
         ))
-
     else:
-        raise ValueError(f"Unknown exit strategy: {strategy_name!r}. Use 'hab'.")
+        raise ValueError(f"Unknown exit type: {exit_type!r}")
+
+
+def _build_strategies(cfg: Dict[str, Any], allow_short: bool) -> List[StrategySlot]:
+    """Build strategy slots from config."""
+    strategies_cfg = cfg.get("strategies", [])
+
+    if strategies_cfg:
+        # New multi-strategy format
+        slots = []
+        for s in strategies_cfg:
+            sid = s["id"]
+            entry = _build_entry(s.get("entry", {}), allow_short)
+            exit_ = _build_exit(s.get("exit", {}))
+            slots.append(StrategySlot(sid, entry, exit_))
+        return slots
+
+    # Legacy single-strategy format (backward compat)
+    entry_cfg = cfg.get("entry", {})
+    exit_cfg = cfg.get("exit", {})
+    entry = _build_entry(
+        {"type": entry_cfg.get("strategy", "hab"), **{k: v for k, v in entry_cfg.items() if k != "strategy"}},
+        allow_short,
+    )
+    exit_ = _build_exit(
+        {"type": exit_cfg.get("strategy", "hab"), **{k: v for k, v in exit_cfg.items() if k != "strategy"}},
+    )
+    return [StrategySlot("default", entry, exit_)]
 
 
 def build_engine(cfg: Optional[Dict[str, Any]] = None) -> StrategyEngine:
-    """Build a fully configured StrategyEngine from config dict.
-
-    If cfg is None, loads from config.yaml automatically.
-    """
+    """Build a fully configured StrategyEngine from config dict."""
     if cfg is None:
         cfg = load_config()
 
     engine_cfg = build_engine_config(cfg)
-    entry_strategy = _build_entry_strategy(cfg, allow_short=engine_cfg.allow_short)
-    exit_strategy = _build_exit_strategy(cfg)
+    strategies = _build_strategies(cfg, allow_short=engine_cfg.allow_short)
 
-    return StrategyEngine(
-        config=engine_cfg,
-        entry_strategy=entry_strategy,
-        exit_strategy=exit_strategy,
-    )
+    return StrategyEngine(config=engine_cfg, strategies=strategies)
 
 
 def get_data_config(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
