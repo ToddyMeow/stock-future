@@ -82,7 +82,6 @@ class HABConfig:
     margin_rate_col: str = "margin_rate"
     default_margin_rate: float = 0.10
     max_portfolio_leverage: float = 3.0
-
     eps: float = 1e-12
 
 

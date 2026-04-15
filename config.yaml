@@ -19,10 +19,6 @@ engine:
   max_portfolio_leverage: 3.0
   default_margin_rate: 0.10
 
-  # 回撤熔断
-  max_drawdown_halt: 0.15    # 触发：-15%
-  drawdown_resume: 0.10      # 解除：-10%
-
   # 填充机制
   risk_blowout_cap: 1.5
   risk_blowout_action: "SHRINK"

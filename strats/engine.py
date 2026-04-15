@@ -65,13 +65,6 @@ class EngineConfig:
     risk_blowout_action: Literal["SHRINK", "CANCEL"] = "SHRINK"
     allow_short: bool = False
 
-    # Drawdown circuit breaker: stop opening new positions when portfolio
-    # drawdown from equity peak exceeds this threshold (e.g. 0.15 = -15%).
-    # Resumes when drawdown recovers above resume threshold (default: half of halt).
-    # Set halt to 1.0 to disable.
-    max_drawdown_halt: float = 1.0
-    drawdown_resume: float = 0.05
-
     eps: float = 1e-12
 
 
@@ -332,8 +325,6 @@ class StrategyEngine:
         last_close_by_symbol: Dict[str, float] = {}
 
         cash = float(cfg.initial_capital)
-        equity_peak = float(cfg.initial_capital)
-        in_drawdown_halt = False
 
         for date in dates:
             day_df = rows_by_date[date]
@@ -481,15 +472,6 @@ class StrategyEngine:
                 last_close_by_symbol=last_close_by_symbol,
             )
 
-            # Drawdown circuit breaker with hysteresis (halt/resume)
-            equity_peak = max(equity_peak, equity_close)
-            current_drawdown = (equity_close / equity_peak - 1.0) if equity_peak > cfg.eps else 0.0
-            if not in_drawdown_halt and current_drawdown < -cfg.max_drawdown_halt:
-                in_drawdown_halt = True
-            elif in_drawdown_halt and current_drawdown > -cfg.drawdown_resume:
-                in_drawdown_halt = False
-            drawdown_halt = in_drawdown_halt
-
             # 6) Signal generation / next-open pending entries.
             # Initialize risk_reject for all strategies x symbols
             for slot in self._strategies:
@@ -530,9 +512,7 @@ class StrategyEngine:
                     direction = int(row["entry_direction"])
                     reason: Optional[str] = None
 
-                    if drawdown_halt:
-                        reason = "DRAWDOWN_HALT"
-                    elif pd.isna(row["next_trade_date"]):
+                    if pd.isna(row["next_trade_date"]):
                         reason = "NO_NEXT_TRADE_DATE"
                     elif key in positions:
                         reason = "ALREADY_IN_POSITION"
@@ -618,8 +598,6 @@ class StrategyEngine:
                     "accepted_signal_risk_today": accepted_today_risk_total,
                     "total_notional": total_notional,
                     "leverage": leverage,
-                    "drawdown_pct": current_drawdown,
-                    "drawdown_halt": drawdown_halt,
                 }
             )
 

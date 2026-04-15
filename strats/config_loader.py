@@ -23,7 +23,13 @@ from strats.entries.double_ma_entry import DoubleMaEntryConfig, DoubleMaEntryStr
 from strats.entries.hab_entry import HABEntryConfig, HABEntryStrategy
 from strats.entries.hl_entry import HLEntryConfig, HLEntryStrategy
 from strats.entries.rand_entry import RandEntryConfig, RandEntryStrategy
+from strats.exits.ama_exit import AmaExitConfig, AmaExitStrategy
+from strats.exits.atr_trail_exit import AtrTrailExitConfig, AtrTrailExitStrategy
+from strats.exits.boll_exit import BollExitConfig, BollExitStrategy
+from strats.exits.double_ma_exit import DoubleMaExitConfig, DoubleMaExitStrategy
 from strats.exits.hab_exit import HABExitConfig, HABExitStrategy
+from strats.exits.hl_exit import HLExitConfig, HLExitStrategy
+from strats.exits.term_exit import TermExitConfig, TermExitStrategy
 
 
 def load_config(path: Optional[str] = None) -> Dict[str, Any]:
@@ -49,8 +55,6 @@ def build_engine_config(cfg: Dict[str, Any]) -> EngineConfig:
         risk_blowout_cap=float(e.get("risk_blowout_cap", 1.5)),
         risk_blowout_action=e.get("risk_blowout_action", "SHRINK"),
         allow_short=bool(e.get("allow_short", False)),
-        max_drawdown_halt=float(e.get("max_drawdown_halt", 1.0)),
-        drawdown_resume=float(e.get("drawdown_resume", 0.05)),
     )
 
 
@@ -129,6 +133,42 @@ def _build_exit(exit_cfg: Dict[str, Any]) -> Any:
             time_fail_target_r=float(p.get("time_fail_target_r", 0.5)),
             trail_activate_r=float(p.get("trail_activate_r", 1.0)),
             trail_atr_mult=float(p.get("trail_atr_mult", 2.0)),
+        ))
+    elif exit_type == "hl":
+        p = exit_cfg.get("hl", {})
+        return HLExitStrategy(HLExitConfig(
+            period=int(p.get("period", 21)),
+        ))
+    elif exit_type == "boll":
+        p = exit_cfg.get("boll", {})
+        return BollExitStrategy(BollExitConfig(
+            period=int(p.get("period", 22)),
+            k=float(p.get("k", 2.0)),
+        ))
+    elif exit_type == "ama":
+        p = exit_cfg.get("ama", {})
+        return AmaExitStrategy(AmaExitConfig(
+            n=int(p.get("n", 10)),
+            fast_period=int(p.get("fast_period", 2)),
+            slow_period=int(p.get("slow_period", 30)),
+        ))
+    elif exit_type == "atr_trail":
+        p = exit_cfg.get("atr_trail", {})
+        return AtrTrailExitStrategy(AtrTrailExitConfig(
+            atr_mult=float(p.get("atr_mult", 2.0)),
+        ))
+    elif exit_type == "term":
+        p = exit_cfg.get("term", {})
+        return TermExitStrategy(TermExitConfig(
+            min_bars=int(p.get("min_bars", 2)),
+            max_bars=int(p.get("max_bars", 13)),
+            min_target_r=float(p.get("min_target_r", 1.0)),
+        ))
+    elif exit_type == "double_ma":
+        p = exit_cfg.get("double_ma", {})
+        return DoubleMaExitStrategy(DoubleMaExitConfig(
+            fast=int(p.get("fast", 13)),
+            slow=int(p.get("slow", 34)),
         ))
     else:
         raise ValueError(f"Unknown exit type: {exit_type!r}")
