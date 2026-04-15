@@ -9,12 +9,14 @@ class FuturesMeta:
     commission: float
     slippage: float
     group_name: str
+    margin_rate: float = 0.10
 
 
 DEFAULT_FUTURES_META = FuturesMeta(
     commission=5.0,
     slippage=1.0,
     group_name="unknown",
+    margin_rate=0.10,
 )
 
 EXCHANGE_GROUP_MAP = {
