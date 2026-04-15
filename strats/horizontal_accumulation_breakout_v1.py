@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -52,11 +52,11 @@ class HABConfig:
     trail_atr_mult: float = 2.0
 
     risk_blowout_cap: float = 1.5
-    risk_blowout_action: str = "SHRINK"
+    risk_blowout_action: Literal["SHRINK", "CANCEL"] = "SHRINK"
 
     allow_short: bool = False
 
-    structure_fail_mode: str = "CLOSE_BELOW_BOX"
+    structure_fail_mode: Literal["CLOSE_BELOW_BOX", "CLOSE_BELOW_BOX_MINUS_ATR", "CONSECUTIVE_CLOSE"] = "CLOSE_BELOW_BOX"
     structure_fail_atr_buffer: float = 0.5
     structure_fail_consecutive: int = 2
 
@@ -161,18 +161,46 @@ class HorizontalAccumulationBreakoutV1:
     def __init__(self, config: Optional[HABConfig] = None) -> None:
         self.config = config or HABConfig()
 
+    @staticmethod
+    def _apply_exit_slippage(base_price: float, slippage: float, direction: int) -> float:
+        return base_price - slippage if direction == 1 else base_price + slippage
+
+    @staticmethod
+    def _directional_pnl(exit_price: float, entry_price: float, direction: int) -> float:
+        """Signed P&L per unit: positive = favorable for the position."""
+        return (exit_price - entry_price) if direction == 1 else (entry_price - exit_price)
+
+    @staticmethod
+    def _favorable_excursion(extreme_price: float, entry_price: float, direction: int) -> float:
+        if direction == 1:
+            return max(extreme_price - entry_price, 0.0)
+        return max(entry_price - extreme_price, 0.0)
+
+    @staticmethod
+    def _adverse_excursion(extreme_price: float, entry_price: float, direction: int) -> float:
+        if direction == 1:
+            return max(entry_price - extreme_price, 0.0)
+        return max(extreme_price - entry_price, 0.0)
+
     def prepare_data(self, bars: pd.DataFrame) -> pd.DataFrame:
         cfg = self.config
         self._validate_input_columns(bars)
 
         df = bars.copy()
-        df[cfg.date_col] = pd.to_datetime(df[cfg.date_col], errors="raise")
+
+        # Fix 1: Normalize dates to trading-day granularity.
+        dt = pd.to_datetime(df[cfg.date_col], errors="raise")
+        if hasattr(dt.dt, "tz") and dt.dt.tz is not None:
+            dt = dt.dt.tz_convert("Asia/Shanghai").dt.tz_localize(None)
+        df[cfg.date_col] = dt.dt.normalize()
+
         df = df.sort_values([cfg.symbol_col, cfg.date_col]).reset_index(drop=True)
 
-        duplicate_mask = df.duplicated(subset=[cfg.symbol_col, cfg.date_col])
+        # Duplicate check on normalized dates (catches same-day different timestamps).
+        duplicate_mask = df.duplicated(subset=[cfg.symbol_col, cfg.date_col], keep=False)
         if duplicate_mask.any():
             dupes = df.loc[duplicate_mask, [cfg.symbol_col, cfg.date_col]]
-            raise ValueError(f"Duplicate symbol/date rows found:\n{dupes}")
+            raise ValueError(f"Duplicate symbol/date rows after date normalization:\n{dupes}")
 
         numeric_cols = [
             cfg.open_col,
@@ -188,16 +216,40 @@ class HorizontalAccumulationBreakoutV1:
         for col in numeric_cols:
             df[col] = pd.to_numeric(df[col], errors="raise")
 
-        for col in [cfg.multiplier_col, cfg.commission_col, cfg.slippage_col, cfg.group_col]:
-            df[col] = df.groupby(cfg.symbol_col, sort=False)[col].ffill().bfill()
+        # Fix 2: No bfill — only ffill for metadata, reject leading NaNs.
+        for col in [cfg.multiplier_col, cfg.group_col]:
+            df[col] = df.groupby(cfg.symbol_col, sort=False)[col].ffill()
             if df[col].isna().any():
-                raise ValueError(f"Column '{col}' contains missing values after fill.")
+                raise ValueError(
+                    f"Leading missing values in '{col}'. "
+                    "Cannot backfill from future rows."
+                )
+
+        for col in [cfg.commission_col, cfg.slippage_col]:
+            if df[col].isna().any():
+                raise ValueError(
+                    f"Column '{col}' contains missing values. "
+                    "Provide an explicit cost schedule."
+                )
 
         # Backward compatibility: add margin_rate if missing.
         if cfg.margin_rate_col not in df.columns:
             df[cfg.margin_rate_col] = cfg.default_margin_rate
 
         self._validate_input_values(df)
+
+        # Fix 3: Gap audit — warn about suspicious data gaps per symbol.
+        self._gap_diagnostics = []
+        for symbol, sym_df in df.groupby(cfg.symbol_col, sort=False):
+            gap_days = sym_df[cfg.date_col].diff().dt.days
+            suspicious = gap_days > 10
+            if suspicious.any():
+                for idx in sym_df.index[suspicious]:
+                    self._gap_diagnostics.append({
+                        "symbol": symbol,
+                        "date": sym_df.loc[idx, cfg.date_col],
+                        "gap_days": int(gap_days.loc[idx]),
+                    })
 
         if df.empty:
             prepared = df.copy()
@@ -406,6 +458,10 @@ class HorizontalAccumulationBreakoutV1:
                 risk_reject[(date, str(row[cfg.symbol_col]))] = None
 
             accepted_today_risk_total = 0.0
+            accepted_notional_today = 0.0
+            base_notional = self._compute_total_notional(
+                positions, pending_entries, close_map, last_close_by_symbol,
+            )
             candidate_rows = [
                 row
                 for _, row in day_df.iterrows()
@@ -463,17 +519,15 @@ class HorizontalAccumulationBreakoutV1:
                             portfolio_risk_if_filled = effective_open_risk + order_risk
                             group_risk_if_filled = effective_open_risk_by_group.get(group_name, 0.0) + order_risk
 
-                            # Leverage check
+                            # Leverage check (base_notional hoisted before loop)
                             new_notional = entry_estimate * contract_multiplier * qty
-                            total_notional = self._compute_total_notional(
-                                positions, pending_entries, close_map, last_close_by_symbol,
-                            ) + new_notional
+                            total_notional_if_filled = base_notional + accepted_notional_today + new_notional
 
                             if portfolio_risk_if_filled > portfolio_cap + cfg.eps:
                                 reason = "PORTFOLIO_RISK_CAP"
                             elif group_risk_if_filled > group_cap + cfg.eps:
                                 reason = "GROUP_RISK_CAP"
-                            elif equity_close > cfg.eps and total_notional / equity_close > cfg.max_portfolio_leverage:
+                            elif equity_close > cfg.eps and total_notional_if_filled / equity_close > cfg.max_portfolio_leverage:
                                 reason = "LEVERAGE_CAP"
                             else:
                                 pending_entries[symbol] = PendingEntry(
@@ -499,12 +553,11 @@ class HorizontalAccumulationBreakoutV1:
                                     contract_multiplier_est=contract_multiplier,
                                 )
                                 accepted_today_risk_total += order_risk
+                                accepted_notional_today += new_notional
 
                 risk_reject[(date, symbol)] = reason
 
-            total_notional = self._compute_total_notional(
-                positions, pending_entries, close_map, last_close_by_symbol,
-            )
+            total_notional = base_notional + accepted_notional_today
             leverage = total_notional / equity_close if equity_close > cfg.eps else 0.0
 
             portfolio_daily.append(
@@ -648,10 +701,10 @@ class HorizontalAccumulationBreakoutV1:
         bb_lower = bb_mid - cfg.bb_std * bb_std
 
 
-        # Positive normalization is deliberate so extreme near-zero or negative-price
-        # regimes cannot flip bandwidth sign and contaminate compression percentiles.
-        # 3）计算Bandwidth
-        bandwidth_denom = bb_mid.abs().where(bb_mid.abs() > cfg.eps, np.nan)
+        # Bandwidth normalized by ATR instead of bb_mid for stability on
+        # back-adjusted continuous futures (additive shift changes bb_mid but not
+        # bb_width or ATR, so bb_width/bb_mid is not shift-invariant).
+        bandwidth_denom = atr.where(atr > cfg.eps, np.nan)
         bandwidth = (bb_upper - bb_lower) / bandwidth_denom
         # 4）计算BB百分位
         bb_percentile = _rolling_last_value_percentile(
@@ -950,49 +1003,32 @@ class HorizontalAccumulationBreakoutV1:
         gap_stop = (d == 1 and open_price <= position.active_stop) or \
                    (d == -1 and open_price >= position.active_stop)
         if gap_stop:
-            exit_fill = open_price - slippage if d == 1 else open_price + slippage
             return self._close_position(
-                position=position,
-                exit_date=date,
-                exit_fill=exit_fill,
-                exit_reason="STOP_GAP",
-                exit_slippage=slippage,
+                position=position, exit_date=date,
+                exit_fill=self._apply_exit_slippage(open_price, slippage, d),
+                exit_reason="STOP_GAP", exit_slippage=slippage,
                 exit_commission_per_contract=exit_commission,
             )
 
         # 2）挂单止损
         if position.pending_exit_reason is not None and position.pending_exit_date == date:
-            exit_fill = open_price - slippage if d == 1 else open_price + slippage
             return self._close_position(
-                position=position,
-                exit_date=date,
-                exit_fill=exit_fill,
-                exit_reason=position.pending_exit_reason,
-                exit_slippage=slippage,
+                position=position, exit_date=date,
+                exit_fill=self._apply_exit_slippage(open_price, slippage, d),
+                exit_reason=position.pending_exit_reason, exit_slippage=slippage,
                 exit_commission_per_contract=exit_commission,
             )
 
-        # 3）日内止损
-        intraday_stop = (d == 1 and low_price <= position.active_stop <= high_price) or \
-                        (d == -1 and low_price <= position.active_stop <= high_price)
-        if intraday_stop:
-            exit_fill = position.active_stop - slippage if d == 1 else position.active_stop + slippage
-            if d == 1:
-                position.mae_price = max(
-                    position.mae_price,
-                    max(position.entry_fill - position.active_stop, 0.0),
-                )
-            else:
-                position.mae_price = max(
-                    position.mae_price,
-                    max(position.active_stop - position.entry_fill, 0.0),
-                )
+        # 3）日内止损 (condition is direction-independent: stop within bar range)
+        if low_price <= position.active_stop <= high_price:
+            position.mae_price = max(
+                position.mae_price,
+                self._adverse_excursion(position.active_stop, position.entry_fill, d),
+            )
             return self._close_position(
-                position=position,
-                exit_date=date,
-                exit_fill=exit_fill,
-                exit_reason="STOP_INTRADAY",
-                exit_slippage=slippage,
+                position=position, exit_date=date,
+                exit_fill=self._apply_exit_slippage(position.active_stop, slippage, d),
+                exit_reason="STOP_INTRADAY", exit_slippage=slippage,
                 exit_commission_per_contract=exit_commission,
             )
 
@@ -1013,49 +1049,27 @@ class HorizontalAccumulationBreakoutV1:
         position.lowest_low_since_entry = min(position.lowest_low_since_entry, low_price)
         position.completed_bars += 1
         # 2）计算MFE、MAE (direction-aware)
-        if d == 1:
-            position.mfe_price = max(
-                position.mfe_price,
-                max(position.highest_high_since_entry - position.entry_fill, 0.0),
-            )
-            position.mae_price = max(
-                position.mae_price,
-                max(position.entry_fill - position.lowest_low_since_entry, 0.0),
-            )
-        else:
-            position.mfe_price = max(
-                position.mfe_price,
-                max(position.entry_fill - position.lowest_low_since_entry, 0.0),
-            )
-            position.mae_price = max(
-                position.mae_price,
-                max(position.highest_high_since_entry - position.entry_fill, 0.0),
-            )
+        fav = position.highest_high_since_entry if d == 1 else position.lowest_low_since_entry
+        adv = position.lowest_low_since_entry if d == 1 else position.highest_high_since_entry
+        position.mfe_price = max(position.mfe_price, self._favorable_excursion(fav, position.entry_fill, d))
+        position.mae_price = max(position.mae_price, self._adverse_excursion(adv, position.entry_fill, d))
 
         if position.pending_exit_reason is None and pd.notna(next_trade_date):
-            # 3）计算结构失败 (direction-aware, mode-aware)
+            # 3）结构失败 (direction-aware, mode-aware)
             atr_now = float(row["atr"]) if pd.notna(row["atr"]) else 0.0
             if position.completed_bars <= cfg.structure_fail_bars:
-                if d == 1:
-                    if cfg.structure_fail_mode == "CLOSE_BELOW_BOX":
-                        bar_fail = close_price <= position.box_high
-                    elif cfg.structure_fail_mode == "CLOSE_BELOW_BOX_MINUS_ATR":
-                        bar_fail = close_price <= position.box_high - cfg.structure_fail_atr_buffer * atr_now
-                    else:
-                        bar_fail = close_price <= position.box_high
-                else:
-                    if cfg.structure_fail_mode == "CLOSE_BELOW_BOX":
-                        bar_fail = close_price >= position.box_low
-                    elif cfg.structure_fail_mode == "CLOSE_BELOW_BOX_MINUS_ATR":
-                        bar_fail = close_price >= position.box_low + cfg.structure_fail_atr_buffer * atr_now
-                    else:
-                        bar_fail = close_price >= position.box_low
+                ref = position.box_high if d == 1 else position.box_low
+                mode = cfg.structure_fail_mode
+                buf = cfg.structure_fail_atr_buffer * atr_now
 
-                if cfg.structure_fail_mode == "CONSECUTIVE_CLOSE":
-                    if bar_fail:
-                        position.consecutive_fail_count += 1
-                    else:
-                        position.consecutive_fail_count = 0
+                if mode == "CLOSE_BELOW_BOX_MINUS_ATR":
+                    threshold = ref - buf if d == 1 else ref + buf
+                else:
+                    threshold = ref
+                bar_fail = close_price <= threshold if d == 1 else close_price >= threshold
+
+                if mode == "CONSECUTIVE_CLOSE":
+                    position.consecutive_fail_count = position.consecutive_fail_count + 1 if bar_fail else 0
                     struct_trigger = position.consecutive_fail_count >= cfg.structure_fail_consecutive
                 else:
                     struct_trigger = bar_fail
@@ -1064,13 +1078,13 @@ class HorizontalAccumulationBreakoutV1:
                     position.pending_exit_reason = "STRUCT_FAIL"
                     position.pending_exit_date = pd.Timestamp(next_trade_date)
 
-            # 4）计算时间失败 (direction-aware) — checked independently from struct fail
+            # 4）时间失败 (direction-aware)
             if position.pending_exit_reason is None and position.completed_bars == cfg.time_fail_bars:
-                if d == 1:
-                    time_fail_cond = position.highest_high_since_entry < position.entry_fill + cfg.time_fail_target_r * position.r_price
-                else:
-                    time_fail_cond = position.entry_fill - position.lowest_low_since_entry < cfg.time_fail_target_r * position.r_price
-                if time_fail_cond:
+                fav_excursion = self._favorable_excursion(
+                    position.highest_high_since_entry if d == 1 else position.lowest_low_since_entry,
+                    position.entry_fill, d,
+                )
+                if fav_excursion < cfg.time_fail_target_r * position.r_price:
                     position.pending_exit_reason = "TIME_FAIL"
                     position.pending_exit_date = pd.Timestamp(next_trade_date)
 
@@ -1118,10 +1132,7 @@ class HorizontalAccumulationBreakoutV1:
         exit_slippage: float,
         exit_commission_per_contract: float,
     ) -> Dict[str, Any]:
-        if position.direction == 1:
-            gross_pnl = (exit_fill - position.entry_fill) * position.contract_multiplier * position.qty
-        else:
-            gross_pnl = (position.entry_fill - exit_fill) * position.contract_multiplier * position.qty
+        gross_pnl = self._directional_pnl(exit_fill, position.entry_fill, position.direction) * position.contract_multiplier * position.qty
         total_entry_commission = position.entry_commission_per_contract * position.qty
         total_exit_commission = exit_commission_per_contract * position.qty
         net_pnl = gross_pnl - total_entry_commission - total_exit_commission
@@ -1194,10 +1205,7 @@ class HorizontalAccumulationBreakoutV1:
         unrealized = 0.0
         for symbol, position in positions.items():
             mark_price = close_map.get(symbol, last_close_by_symbol.get(symbol, position.entry_fill))
-            if position.direction == 1:
-                unrealized += (mark_price - position.entry_fill) * position.contract_multiplier * position.qty
-            else:
-                unrealized += (position.entry_fill - mark_price) * position.contract_multiplier * position.qty
+            unrealized += self._directional_pnl(mark_price, position.entry_fill, position.direction) * position.contract_multiplier * position.qty
         return cash + unrealized
 
 
@@ -1214,13 +1222,8 @@ class HorizontalAccumulationBreakoutV1:
         by_group: Dict[str, float] = {}
         # 计算开仓风险
         for symbol, position in positions.items():
-            # 计算当前价格
             current_price = close_map.get(symbol, last_close_by_symbol.get(symbol, position.entry_fill))
-            # 计算当前风险 (direction-aware)
-            if position.direction == 1:
-                current_risk = max(current_price - position.active_stop, 0.0) * position.contract_multiplier * position.qty
-            else:
-                current_risk = max(position.active_stop - current_price, 0.0) * position.contract_multiplier * position.qty
+            current_risk = max(self._directional_pnl(current_price, position.active_stop, position.direction), 0.0) * position.contract_multiplier * position.qty
             open_risk_total += current_risk
             # 计算分组风险
             by_group[position.group_name] = by_group.get(position.group_name, 0.0) + current_risk
@@ -1244,10 +1247,7 @@ class HorizontalAccumulationBreakoutV1:
             if position.pending_exit_date is not None and position.pending_exit_date <= candidate_entry_date:
                 continue
             current_price = close_map.get(symbol, last_close_by_symbol.get(symbol, position.entry_fill))
-            if position.direction == 1:
-                current_risk = max(current_price - position.active_stop, 0.0) * position.contract_multiplier * position.qty
-            else:
-                current_risk = max(position.active_stop - current_price, 0.0) * position.contract_multiplier * position.qty
+            current_risk = max(self._directional_pnl(current_price, position.active_stop, position.direction), 0.0) * position.contract_multiplier * position.qty
             total += current_risk
             by_group[position.group_name] = by_group.get(position.group_name, 0.0) + current_risk
 
@@ -1695,14 +1695,21 @@ def _wilder_atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int) 
 
 
 def _rolling_last_value_percentile(values: pd.Series, window: int) -> pd.Series:
-    # 计算最后一个值的百分位
+    """Midpoint percentile: (count_less + 0.5 * count_equal) / window.
+
+    When all values are equal the percentile is 0.5 (not 1.0), so a flat
+    narrow-bandwidth window is correctly treated as moderate compression.
+    """
     arr = values.to_numpy(dtype=float)
     out = np.full(len(arr), np.nan, dtype=float)
     for i in range(window - 1, len(arr)):
         sample = arr[i - window + 1 : i + 1]
         if np.isnan(sample).any():
             continue
-        out[i] = float(np.sum(sample <= sample[-1])) / float(window)
+        last = sample[-1]
+        less = float(np.sum(sample < last))
+        equal = float(np.sum(sample == last))
+        out[i] = (less + 0.5 * equal) / float(window)
     return pd.Series(out, index=values.index)
 
 

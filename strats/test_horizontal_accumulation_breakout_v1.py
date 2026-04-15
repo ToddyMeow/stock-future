@@ -528,36 +528,39 @@ def test_short_entry_fill_uses_open_minus_slippage() -> None:
     result = engine.run(df)
 
     total = len(result.trades) + len(result.open_positions)
-    if total > 0:
-        entry_fill = (
-            result.open_positions.iloc[0]["entry_fill"] if len(result.open_positions) > 0
-            else result.trades.iloc[0]["entry_fill"]
-        )
-        entry_open = df.loc[8, "open"]  # entry day open
-        assert entry_fill == pytest.approx(entry_open - 0.5)
+    assert total >= 1, "Expected a short position or trade"
+    entry_fill = (
+        result.open_positions.iloc[0]["entry_fill"] if len(result.open_positions) > 0
+        else result.trades.iloc[0]["entry_fill"]
+    )
+    entry_open = df.loc[8, "open"]  # entry day open
+    assert entry_fill == pytest.approx(entry_open - 0.5)
 
 
 def test_short_pnl_positive_when_price_drops() -> None:
-    """Short trade has positive P&L when exit price < entry price."""
+    """Short trade has positive P&L when exiting below entry.
+
+    Entry ~95, price drops, then struct_fail when close rises above box_low.
+    Exit open ~93 is below entry ~95 → positive gross_pnl for short.
+    """
     df = make_short_frame(
         [
             (95.0, 95.5, 94.0, 94.5),    # entry day
             (94.0, 94.5, 90.0, 90.5),    # price drops
-            (90.0, 91.0, 89.0, 89.5),    # keep dropping
-            (89.0, 89.5, 88.0, 88.5),
-            (88.0, 88.5, 87.0, 87.5),
-            (87.0, 87.5, 86.0, 86.5),    # time fail at bar 5
-            (86.0, 86.5, 85.0, 85.5),    # exit
+            (91.0, 99.5, 90.5, 99.0),    # close above box_low → struct fail
+            (93.0, 93.5, 92.5, 93.0),    # exit day: open 93 < entry 95
+            (93.0, 93.5, 92.5, 93.2),
         ],
         start="2025-11-01",
     )
     engine = HorizontalAccumulationBreakoutV1(make_test_config(allow_short=True))
     result = engine.run(df)
 
-    if len(result.trades) > 0:
-        trade = result.trades.iloc[0]
-        assert trade["direction"] == -1
-        assert trade["gross_pnl"] > 0  # price went down, short profits
+    assert len(result.trades) >= 1, "Expected at least one closed short trade"
+    trade = result.trades.iloc[0]
+    assert trade["direction"] == -1
+    assert trade["exit_reason"] == "STRUCT_FAIL"
+    assert trade["gross_pnl"] > 0  # exit below entry → short profits
 
 
 def test_short_gap_stop_exits_when_open_above_stop() -> None:
@@ -573,11 +576,11 @@ def test_short_gap_stop_exits_when_open_above_stop() -> None:
     engine = HorizontalAccumulationBreakoutV1(make_test_config(allow_short=True))
     result = engine.run(df)
 
-    if len(result.trades) > 0:
-        trade = result.trades.iloc[0]
-        assert trade["direction"] == -1
-        assert trade["exit_reason"] == "STOP_GAP"
-        assert trade["gross_pnl"] < 0  # gap against short
+    assert len(result.trades) >= 1, "Expected a STOP_GAP trade"
+    trade = result.trades.iloc[0]
+    assert trade["direction"] == -1
+    assert trade["exit_reason"] == "STOP_GAP"
+    assert trade["gross_pnl"] < 0  # gap against short
 
 
 def test_short_struct_fail_close_above_box_low() -> None:
@@ -594,10 +597,10 @@ def test_short_struct_fail_close_above_box_low() -> None:
     engine = HorizontalAccumulationBreakoutV1(make_test_config(allow_short=True))
     result = engine.run(df)
 
-    if len(result.trades) > 0:
-        trade = result.trades.iloc[0]
-        assert trade["direction"] == -1
-        assert trade["exit_reason"] == "STRUCT_FAIL"
+    assert len(result.trades) >= 1, "Expected a STRUCT_FAIL trade"
+    trade = result.trades.iloc[0]
+    assert trade["direction"] == -1
+    assert trade["exit_reason"] == "STRUCT_FAIL"
 
 
 def test_allow_short_false_no_short_signals() -> None:
