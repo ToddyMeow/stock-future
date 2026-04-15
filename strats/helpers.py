@@ -58,7 +58,16 @@ def wilder_atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int) -
     atr_values = np.full(len(tr_values), np.nan, dtype=float)
     atr_values[period - 1] = np.nanmean(tr_values[:period])
     for i in range(period, len(tr_values)):
-        atr_values[i] = ((atr_values[i - 1] * (period - 1)) + tr_values[i]) / period
+        prev = atr_values[i - 1]
+        cur_tr = tr_values[i]
+        if np.isnan(cur_tr):
+            # Skip NaN TR: carry forward previous ATR instead of poisoning
+            atr_values[i] = prev
+        elif np.isnan(prev):
+            # Previous ATR was NaN (shouldn't happen after init, but guard)
+            atr_values[i] = cur_tr
+        else:
+            atr_values[i] = ((prev * (period - 1)) + cur_tr) / period
     return pd.Series(atr_values, index=tr.index)
 
 
