@@ -20,6 +20,7 @@ from strats.helpers import (
     detect_lhl_pattern,
     PortfolioAnalyzer,
 )
+from strats.exits.hab_exit import HABExitStrategy, HABExitConfig
 
 
 @dataclass(frozen=True)
@@ -172,6 +173,17 @@ class HorizontalAccumulationBreakoutV1:
 
     def __init__(self, config: Optional[HABConfig] = None) -> None:
         self.config = config or HABConfig()
+        cfg = self.config
+        self._exit_strategy = HABExitStrategy(HABExitConfig(
+            structure_fail_bars=cfg.structure_fail_bars,
+            structure_fail_mode=cfg.structure_fail_mode,
+            structure_fail_atr_buffer=cfg.structure_fail_atr_buffer,
+            structure_fail_consecutive=cfg.structure_fail_consecutive,
+            time_fail_bars=cfg.time_fail_bars,
+            time_fail_target_r=cfg.time_fail_target_r,
+            trail_activate_r=cfg.trail_activate_r,
+            trail_atr_mult=cfg.trail_atr_mult,
+        ))
 
     # Direction helpers delegate to module-level functions in helpers.py
     _apply_exit_slippage = staticmethod(apply_exit_slippage)
@@ -1032,92 +1044,8 @@ class HorizontalAccumulationBreakoutV1:
         return None
 
     def _process_close_phase(self, position: Position, row: pd.Series) -> None:
-        # 收盘处理
-        cfg = self.config
-        d = position.direction
-        high_price = float(row[cfg.high_col])
-        low_price = float(row[cfg.low_col])
-        close_price = float(row[cfg.close_col])
-        date = pd.Timestamp(row[cfg.date_col])
-        next_trade_date = row["next_trade_date"]
-
-        # 1）更新最高高、最低低
-        position.highest_high_since_entry = max(position.highest_high_since_entry, high_price)
-        position.lowest_low_since_entry = min(position.lowest_low_since_entry, low_price)
-        position.completed_bars += 1
-        # 2）计算MFE、MAE (direction-aware)
-        fav = position.highest_high_since_entry if d == 1 else position.lowest_low_since_entry
-        adv = position.lowest_low_since_entry if d == 1 else position.highest_high_since_entry
-        position.mfe_price = max(position.mfe_price, self._favorable_excursion(fav, position.entry_fill, d))
-        position.mae_price = max(position.mae_price, self._adverse_excursion(adv, position.entry_fill, d))
-
-        if position.pending_exit_reason is None and pd.notna(next_trade_date):
-            # 3）结构失败 (direction-aware, mode-aware)
-            atr_now = float(row["atr"]) if pd.notna(row["atr"]) else 0.0
-            if position.completed_bars <= cfg.structure_fail_bars:
-                ref = position.box_high if d == 1 else position.box_low
-                mode = cfg.structure_fail_mode
-                buf = cfg.structure_fail_atr_buffer * atr_now
-
-                if mode == "CLOSE_BELOW_BOX_MINUS_ATR":
-                    threshold = ref - buf if d == 1 else ref + buf
-                else:
-                    threshold = ref
-                bar_fail = close_price <= threshold if d == 1 else close_price >= threshold
-
-                if mode == "CONSECUTIVE_CLOSE":
-                    position.consecutive_fail_count = position.consecutive_fail_count + 1 if bar_fail else 0
-                    struct_trigger = position.consecutive_fail_count >= cfg.structure_fail_consecutive
-                else:
-                    struct_trigger = bar_fail
-
-                if struct_trigger:
-                    position.pending_exit_reason = "STRUCT_FAIL"
-                    position.pending_exit_date = pd.Timestamp(next_trade_date)
-
-            # 4）时间失败 (direction-aware)
-            if position.pending_exit_reason is None and position.completed_bars == cfg.time_fail_bars:
-                fav_excursion = self._favorable_excursion(
-                    position.highest_high_since_entry if d == 1 else position.lowest_low_since_entry,
-                    position.entry_fill, d,
-                )
-                if fav_excursion < cfg.time_fail_target_r * position.r_price:
-                    position.pending_exit_reason = "TIME_FAIL"
-                    position.pending_exit_date = pd.Timestamp(next_trade_date)
-
-        # 5）计算ATR
-        atr_today = float(row["atr"]) if pd.notna(row["atr"]) else np.nan
-        trailing_stop_candidate: Optional[float] = None
-        active_stop_before = position.active_stop
-
-        # 6）计算活动止损 (direction-aware)
-        if np.isfinite(atr_today):
-            if d == 1:
-                trail_activated = position.highest_high_since_entry >= position.entry_fill + cfg.trail_activate_r * position.r_price
-                if trail_activated:
-                    trailing_stop_candidate = position.highest_high_since_entry - cfg.trail_atr_mult * atr_today
-                    position.active_stop = max(position.active_stop, trailing_stop_candidate)
-            else:
-                trail_activated = position.entry_fill - position.lowest_low_since_entry >= cfg.trail_activate_r * position.r_price
-                if trail_activated:
-                    trailing_stop_candidate = position.lowest_low_since_entry + cfg.trail_atr_mult * atr_today
-                    position.active_stop = min(position.active_stop, trailing_stop_candidate)
-
-        position.active_stop_series.append(
-            {
-                "computed_on": date.strftime("%Y-%m-%d"),
-                "effective_from": (
-                    pd.Timestamp(next_trade_date).strftime("%Y-%m-%d")
-                    if pd.notna(next_trade_date)
-                    else None
-                ),
-                "phase": "close_update",
-                "active_stop_before": active_stop_before,
-                "active_stop_after": position.active_stop,
-                "trailing_stop_candidate": trailing_stop_candidate,
-                "atr_used": atr_today if np.isfinite(atr_today) else None,
-                "highest_high_since_entry": position.highest_high_since_entry,
-            }
+        self._exit_strategy.process_close_phase(
+            position=position, row=row, next_trade_date=row["next_trade_date"],
         )
 
     def _close_position(
