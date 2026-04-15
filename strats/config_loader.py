@@ -29,6 +29,7 @@ from strats.exits.boll_exit import BollExitConfig, BollExitStrategy
 from strats.exits.double_ma_exit import DoubleMaExitConfig, DoubleMaExitStrategy
 from strats.exits.hab_exit import HABExitConfig, HABExitStrategy
 from strats.exits.hl_exit import HLExitConfig, HLExitStrategy
+from strats.exits.rand_exit import RandExitConfig, RandExitStrategy
 from strats.exits.term_exit import TermExitConfig, TermExitStrategy
 
 
@@ -167,6 +168,13 @@ def _build_exit(exit_cfg: Dict[str, Any]) -> Any:
         return DoubleMaExitStrategy(DoubleMaExitConfig(
             fast=int(p.get("fast", 13)),
             slow=int(p.get("slow", 34)),
+        ))
+    elif exit_type == "rand":
+        p = exit_cfg.get("rand", {})
+        return RandExitStrategy(RandExitConfig(
+            seed=int(p.get("seed", 42)),
+            exit_probability=float(p.get("exit_probability", 0.1)),
+            min_bars=int(p.get("min_bars", 1)),
         ))
     else:
         raise ValueError(f"Unknown exit type: {exit_type!r}")
