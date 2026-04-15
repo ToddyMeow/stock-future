@@ -60,6 +60,10 @@ class EngineConfig:
     # Shared technical
     atr_period: int = 20
 
+    # R definition: R = stop_atr_mult × ATR(atr_period)
+    # initial_stop = entry_price ∓ stop_atr_mult × atr_ref
+    stop_atr_mult: float = 2.0
+
     # Fill mechanics
     risk_blowout_cap: float = 1.5
     risk_blowout_action: Literal["SHRINK", "CANCEL"] = "SHRINK"
@@ -520,9 +524,13 @@ class StrategyEngine:
                         reason = "PENDING_ENTRY_EXISTS"
                     else:
                         entry_estimate = float(row[cfg.close_col])
-                        initial_stop = float(row["initial_stop"])
+                        atr_ref_val = float(row["atr_ref"]) if pd.notna(row.get("atr_ref")) else np.nan
                         contract_multiplier = float(row[cfg.multiplier_col])
-                        estimated_initial_risk = abs(entry_estimate - initial_stop)
+                        estimated_initial_risk = cfg.stop_atr_mult * atr_ref_val if np.isfinite(atr_ref_val) else np.nan
+                        if direction == 1:
+                            initial_stop = entry_estimate - estimated_initial_risk
+                        else:
+                            initial_stop = entry_estimate + estimated_initial_risk
                         per_contract_risk_est = estimated_initial_risk * contract_multiplier
 
                         if not np.isfinite(per_contract_risk_est) or per_contract_risk_est <= 0.0:
@@ -1195,7 +1203,7 @@ class StrategyEngine:
 
     # Engine-universal columns always present in prepared data
     _ENGINE_BASE_COLUMNS = ["atr", "atr_ref", "next_trade_date"]
-    _ENGINE_SIGNAL_COLUMNS = ["entry_trigger_pass", "entry_direction", "initial_stop"]
+    _ENGINE_SIGNAL_COLUMNS = ["entry_trigger_pass", "entry_direction"]
 
     def _prepared_extra_columns(self) -> List[str]:
         """Minimum extra columns guaranteed by the engine (for empty frame)."""
@@ -1212,7 +1220,7 @@ class StrategyEngine:
             "atr", "atr_ref",
         ]
         # Entry-strategy-specific columns (everything the strategy added beyond engine base)
-        skip = set(base) | {"next_trade_date", "initial_stop", "risk_reject_reason"}
+        skip = set(base) | {"next_trade_date", "risk_reject_reason"}
         skip |= {cfg.multiplier_col, cfg.commission_col, cfg.slippage_col, cfg.margin_rate_col}
         extra = [c for c in prepared.columns if c not in skip]
         # Always end with required signal columns

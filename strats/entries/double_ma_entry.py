@@ -4,9 +4,6 @@ Enter on golden cross (fast MA crosses above slow MA) or death cross
 (fast MA crosses below slow MA). Uses the slow MA as the initial stop.
 
 R definition:
-  Long:  initial_stop = ma_slow
-  Short: initial_stop = ma_slow
-  R = |close - initial_stop|
 """
 
 from __future__ import annotations
@@ -17,13 +14,11 @@ from typing import Any, Dict, Optional
 import numpy as np
 import pandas as pd
 
-
 @dataclass(frozen=True)
 class DoubleMaEntryConfig:
     fast: int = 13
     slow: int = 34
     allow_short: bool = False
-
 
 class DoubleMaEntryStrategy:
     """Double MA crossover entry."""
@@ -59,14 +54,12 @@ class DoubleMaEntryStrategy:
         entry_direction[short_trigger.fillna(False) & ~long_trigger.fillna(False)] = -1
 
         # Initial stop: slow MA as support/resistance
-        initial_stop = ma_slow.copy()
 
         out = df.copy()
         out["ma_fast"] = ma_fast
         out["ma_slow"] = ma_slow
         out["entry_trigger_pass"] = entry_trigger_pass
         out["entry_direction"] = entry_direction
-        out["initial_stop"] = initial_stop
         return out
 
     def build_pending_entry_metadata(self, row: pd.Series) -> Dict[str, Any]:

@@ -68,9 +68,6 @@ def test_donchian_long_signal_on_new_high():
     signal_bar = result.iloc[-1]
     assert signal_bar["entry_trigger_pass"] == True
     assert signal_bar["entry_direction"] == 1
-    assert pd.notna(signal_bar["initial_stop"])
-    # Stop equals channel_low (no ATR buffer in HL)
-    assert signal_bar["initial_stop"] == pytest.approx(signal_bar["channel_low"])
 
 
 def test_donchian_short_signal_on_new_low():
@@ -85,8 +82,6 @@ def test_donchian_short_signal_on_new_low():
     signal_bar = result.iloc[-1]
     assert signal_bar["entry_trigger_pass"] == True
     assert signal_bar["entry_direction"] == -1
-    # Stop equals channel_high (no ATR buffer in HL)
-    assert signal_bar["initial_stop"] == pytest.approx(signal_bar["channel_high"])
 
 
 def test_donchian_no_signal_within_channel():
@@ -114,19 +109,6 @@ def test_donchian_no_short_when_disabled():
 
     signal_bar = result.iloc[-1]
     assert signal_bar["entry_trigger_pass"] == False
-
-
-def test_donchian_stop_is_channel_boundary():
-    """Initial stop equals channel_low for long (no ATR buffer in HL)."""
-    bars = CHANNEL_BARS + [
-        (101.0, 105.0, 100.5, 104.0),
-    ]
-    df = _make_df(bars)
-    strategy = DonchianEntryStrategy(DonchianEntryConfig(period=5))
-    result = strategy.prepare_signals(df)
-
-    signal_bar = result.iloc[-1]
-    assert signal_bar["initial_stop"] == pytest.approx(signal_bar["channel_low"])
 
 
 def test_donchian_metadata():

@@ -24,17 +24,11 @@ class EntryStrategy(Protocol):
         Must return the same DataFrame with AT LEAST these columns added:
           - ``entry_trigger_pass`` (bool): True on bars that fire an entry
           - ``entry_direction``    (int):  1=long, -1=short, 0=no signal
-          - ``initial_stop``       (float): stop price for the signal
 
-        R definition contract:
-          R (unit risk) = |entry_price - initial_stop|.
-          The engine computes this from ``close`` (signal bar) and ``initial_stop``.
-          Different entry strategies produce different R by setting ``initial_stop``
-          differently (box low - ATR buffer, N-day low, MA distance, etc.).
-          The exit strategy and risk management read R as ``position.r_price``
-          and ``position.r_money`` — they never recompute it from strategy-specific
-          fields, so any entry strategy that provides a valid ``initial_stop``
-          integrates seamlessly.
+        R definition:
+          R = stop_atr_mult × ATR, defined by EngineConfig (not the entry strategy).
+          The engine computes initial_stop = close ∓ R after reading the signal.
+          Entry strategies do NOT set initial_stop — they only decide direction.
         """
         ...
 

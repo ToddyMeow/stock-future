@@ -4,9 +4,6 @@ Enter when price closes outside the Bollinger Bands. Uses the opposite
 band as the initial stop.
 
 R definition:
-  Long:  initial_stop = lower band
-  Short: initial_stop = upper band
-  R = |close - initial_stop|
 """
 
 from __future__ import annotations
@@ -17,13 +14,11 @@ from typing import Any, Dict, Optional
 import numpy as np
 import pandas as pd
 
-
 @dataclass(frozen=True)
 class BollBreakEntryConfig:
     period: int = 22
     k: float = 2.0
     allow_short: bool = False
-
 
 class BollBreakEntryStrategy:
     """Bollinger Band breakout entry."""
@@ -60,11 +55,7 @@ class BollBreakEntryStrategy:
         entry_direction[short_trigger.fillna(False) & ~long_trigger.fillna(False)] = -1
 
         # Initial stop: opposite band
-        initial_stop_long = lower.copy()
-        initial_stop_short = upper.copy()
-        initial_stop = initial_stop_long.copy()
         short_mask = entry_direction == -1
-        initial_stop[short_mask] = initial_stop_short[short_mask]
 
         out = df.copy()
         out["boll_upper"] = upper
@@ -72,7 +63,6 @@ class BollBreakEntryStrategy:
         out["boll_ma"] = ma
         out["entry_trigger_pass"] = entry_trigger_pass
         out["entry_direction"] = entry_direction
-        out["initial_stop"] = initial_stop
         return out
 
     def build_pending_entry_metadata(self, row: pd.Series) -> Dict[str, Any]:

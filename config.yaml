@@ -12,6 +12,9 @@ engine:
   initial_capital: 1_000_000
   atr_period: 20
 
+  # R = stop_atr_mult × ATR(atr_period)
+  stop_atr_mult: 2.0
+
   # 风控
   risk_per_trade: 0.02
   portfolio_risk_cap: 0.15

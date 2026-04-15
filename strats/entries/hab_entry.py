@@ -14,7 +14,6 @@ from strats.helpers import (
     rolling_last_value_percentile,
 )
 
-
 @dataclass(frozen=True)
 class HABEntryConfig:
     bb_period: int = 20
@@ -26,10 +25,8 @@ class HABEntryConfig:
     tol_atr_mult: float = 0.25
     breakout_atr_mult: float = 0.5
     upper_shadow_ratio_max: float = 0.25
-    initial_stop_atr_mult: float = 0.4
     allow_short: bool = False
     eps: float = 1e-12
-
 
 class HABEntryStrategy:
     """HAB entry: box detection + BB compression + breakout confirmation."""
@@ -42,7 +39,7 @@ class HABEntryStrategy:
 
         Expects ``atr`` and ``atr_ref`` columns already present (computed by engine).
         Adds: BB indicators, box detection, pattern flags, entry_trigger_pass,
-        entry_direction, initial_stop, plus diagnostic columns.
+        entry_direction, plus diagnostic columns.
         """
         cfg = self.config
         high = df["high"].astype(float)
@@ -137,11 +134,7 @@ class HABEntryStrategy:
         entry_direction[long_trigger] = 1
         entry_direction[short_trigger & ~long_trigger] = -1
 
-        initial_stop_long = box_low - cfg.initial_stop_atr_mult * atr_ref
-        initial_stop_short = box_high + cfg.initial_stop_atr_mult * atr_ref
-        initial_stop = initial_stop_long.copy()
         short_mask = entry_direction == -1
-        initial_stop[short_mask] = initial_stop_short[short_mask]
 
         # Write all columns to the output frame
         out = df.copy()
@@ -167,7 +160,6 @@ class HABEntryStrategy:
         out["bb_filter_pass"] = bb_filter_pass.fillna(False)
         out["entry_trigger_pass"] = entry_trigger_pass.fillna(False)
         out["entry_direction"] = entry_direction
-        out["initial_stop"] = initial_stop
         return out
 
     def build_pending_entry_metadata(self, row: pd.Series) -> Dict[str, Any]:

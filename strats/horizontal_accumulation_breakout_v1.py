@@ -120,6 +120,7 @@ class HorizontalAccumulationBreakoutV1:
             risk_blowout_cap=config.risk_blowout_cap,
             risk_blowout_action=config.risk_blowout_action,
             allow_short=config.allow_short,
+            stop_atr_mult=config.initial_stop_atr_mult,
             eps=config.eps,
         )
 
@@ -133,7 +134,6 @@ class HorizontalAccumulationBreakoutV1:
             tol_atr_mult=config.tol_atr_mult,
             breakout_atr_mult=config.breakout_atr_mult,
             upper_shadow_ratio_max=config.upper_shadow_ratio_max,
-            initial_stop_atr_mult=config.initial_stop_atr_mult,
             allow_short=config.allow_short,
             eps=config.eps,
         )

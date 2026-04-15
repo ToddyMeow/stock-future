@@ -55,6 +55,7 @@ def build_engine_config(cfg: Dict[str, Any]) -> EngineConfig:
         risk_blowout_cap=float(e.get("risk_blowout_cap", 1.5)),
         risk_blowout_action=e.get("risk_blowout_action", "SHRINK"),
         allow_short=bool(e.get("allow_short", False)),
+        stop_atr_mult=float(e.get("stop_atr_mult", 2.0)),
     )
 
 
@@ -74,7 +75,6 @@ def _build_entry(entry_cfg: Dict[str, Any], allow_short: bool) -> Any:
             tol_atr_mult=float(p.get("tol_atr_mult", 0.25)),
             breakout_atr_mult=float(p.get("breakout_atr_mult", 0.5)),
             upper_shadow_ratio_max=float(p.get("upper_shadow_ratio_max", 0.25)),
-            initial_stop_atr_mult=float(p.get("initial_stop_atr_mult", 0.4)),
             allow_short=allow_short,
         ))
     elif entry_type in ("donchian", "hl"):
@@ -97,7 +97,6 @@ def _build_entry(entry_cfg: Dict[str, Any], allow_short: bool) -> Any:
             n=int(p.get("n", 10)),
             fast_period=int(p.get("fast_period", 2)),
             slow_period=int(p.get("slow_period", 30)),
-            stop_atr_mult=float(p.get("stop_atr_mult", 2.0)),
             allow_short=allow_short,
         ))
     elif entry_type == "double_ma":
@@ -111,7 +110,6 @@ def _build_entry(entry_cfg: Dict[str, Any], allow_short: bool) -> Any:
         p = entry_cfg.get("rand", {})
         return RandEntryStrategy(RandEntryConfig(
             seed=int(p.get("seed", 42)),
-            stop_atr_mult=float(p.get("stop_atr_mult", 2.0)),
             allow_short=allow_short,
         ))
     else:

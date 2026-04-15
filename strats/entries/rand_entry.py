@@ -4,9 +4,6 @@ Enters long or short based on a deterministic pseudo-random sequence.
 Useful as a baseline to compare real strategies against.
 
 R definition:
-  Long:  initial_stop = close - stop_atr_mult * atr_ref
-  Short: initial_stop = close + stop_atr_mult * atr_ref
-  R = |close - initial_stop|
 """
 
 from __future__ import annotations
@@ -17,13 +14,10 @@ from typing import Any, Dict, Optional
 import numpy as np
 import pandas as pd
 
-
 @dataclass(frozen=True)
 class RandEntryConfig:
     seed: int = 42
-    stop_atr_mult: float = 2.0
     allow_short: bool = False
-
 
 class RandEntryStrategy:
     """Random entry for benchmarking."""
@@ -62,17 +56,12 @@ class RandEntryStrategy:
             entry_direction[~long_trigger] = 0
 
         # Initial stop: close +/- ATR buffer
-        initial_stop_long = close - cfg.stop_atr_mult * atr_ref
-        initial_stop_short = close + cfg.stop_atr_mult * atr_ref
-        initial_stop = initial_stop_long.copy()
         short_mask = entry_direction == -1
-        initial_stop[short_mask] = initial_stop_short[short_mask]
 
         out = df.copy()
         out["rand_signal"] = rand_signal
         out["entry_trigger_pass"] = entry_trigger_pass
         out["entry_direction"] = entry_direction
-        out["initial_stop"] = initial_stop
         return out
 
     def build_pending_entry_metadata(self, row: pd.Series) -> Dict[str, Any]:

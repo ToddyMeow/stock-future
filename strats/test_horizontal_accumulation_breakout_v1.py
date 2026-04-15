@@ -36,6 +36,7 @@ def make_test_config(**overrides) -> HABConfig:
         portfolio_risk_cap=1.0,
         group_risk_cap=1.0,
         risk_blowout_cap=float("inf"),
+        initial_stop_atr_mult=100.0,
     )
     base.update(overrides)
     return HABConfig(**base)
@@ -164,7 +165,7 @@ def test_gap_open_below_stop_exits_at_open_price_not_at_stop() -> None:
         ],
         start="2025-03-03",
     )
-    engine = HorizontalAccumulationBreakoutV1(make_test_config())
+    engine = HorizontalAccumulationBreakoutV1(make_test_config(initial_stop_atr_mult=3.0))
     result = engine.run(df)
 
     assert len(result.trades) == 1
@@ -237,7 +238,7 @@ def test_cancel_entry_when_open_below_initial_stop() -> None:
         ],
         start="2025-05-01",
     )
-    engine = HorizontalAccumulationBreakoutV1(make_test_config())
+    engine = HorizontalAccumulationBreakoutV1(make_test_config(initial_stop_atr_mult=3.0))
     result = engine.run(df)
 
     assert result.trades.empty
@@ -345,7 +346,7 @@ def test_entry_bar_intraday_stop_after_fill() -> None:
         ],
         start="2025-09-01",
     )
-    engine = HorizontalAccumulationBreakoutV1(make_test_config())
+    engine = HorizontalAccumulationBreakoutV1(make_test_config(initial_stop_atr_mult=3.0))
     result = engine.run(df)
 
     assert len(result.trades) == 1
@@ -369,7 +370,7 @@ def test_risk_blowout_cancel_when_gap_exceeds_cap() -> None:
         start="2025-10-01",
     )
     engine = HorizontalAccumulationBreakoutV1(
-        make_test_config(risk_blowout_cap=1.2, risk_blowout_action="CANCEL")
+        make_test_config(risk_blowout_cap=1.2, risk_blowout_action="CANCEL", initial_stop_atr_mult=3.0)
     )
     result = engine.run(df)
 
@@ -389,7 +390,7 @@ def test_risk_blowout_shrink_reduces_qty() -> None:
         start="2025-10-01",
     )
     engine = HorizontalAccumulationBreakoutV1(
-        make_test_config(risk_blowout_cap=1.2, risk_blowout_action="SHRINK")
+        make_test_config(risk_blowout_cap=1.2, risk_blowout_action="SHRINK", initial_stop_atr_mult=3.0)
     )
     result = engine.run(df)
 
@@ -415,7 +416,7 @@ def test_risk_blowout_shrink_to_zero_cancels() -> None:
         start="2025-10-01",
     )
     engine = HorizontalAccumulationBreakoutV1(
-        make_test_config(initial_capital=270, risk_blowout_cap=1.01, risk_blowout_action="SHRINK")
+        make_test_config(initial_capital=300, risk_blowout_cap=1.01, risk_blowout_action="SHRINK", initial_stop_atr_mult=3.0)
     )
     result = engine.run(df)
 
@@ -573,7 +574,7 @@ def test_short_gap_stop_exits_when_open_above_stop() -> None:
         ],
         start="2025-11-01",
     )
-    engine = HorizontalAccumulationBreakoutV1(make_test_config(allow_short=True))
+    engine = HorizontalAccumulationBreakoutV1(make_test_config(allow_short=True, initial_stop_atr_mult=3.0))
     result = engine.run(df)
 
     assert len(result.trades) >= 1, "Expected a STOP_GAP trade"

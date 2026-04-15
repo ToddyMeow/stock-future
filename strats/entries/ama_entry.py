@@ -4,9 +4,6 @@ Enter when price crosses above/below the AMA while the AMA itself
 is trending in the same direction. Uses an ATR-based stop.
 
 R definition:
-  Long:  initial_stop = ama - stop_atr_mult * atr_ref
-  Short: initial_stop = ama + stop_atr_mult * atr_ref
-  R = |close - initial_stop|
 """
 
 from __future__ import annotations
@@ -17,16 +14,13 @@ from typing import Any, Dict, Optional
 import numpy as np
 import pandas as pd
 
-
 @dataclass(frozen=True)
 class AmaEntryConfig:
     n: int = 10
     fast_period: int = 2
     slow_period: int = 30
-    stop_atr_mult: float = 2.0
     allow_short: bool = False
     eps: float = 1e-12
-
 
 class AmaEntryStrategy:
     """Kaufman AMA trend entry."""
@@ -92,18 +86,13 @@ class AmaEntryStrategy:
         entry_direction[short_trigger.fillna(False) & ~long_trigger.fillna(False)] = -1
 
         # Initial stop: AMA +/- ATR buffer
-        initial_stop_long = ama - cfg.stop_atr_mult * atr_ref
-        initial_stop_short = ama + cfg.stop_atr_mult * atr_ref
-        initial_stop = initial_stop_long.copy()
         short_mask = entry_direction == -1
-        initial_stop[short_mask] = initial_stop_short[short_mask]
 
         out = df.copy()
         out["ama"] = ama
         out["er"] = er_series
         out["entry_trigger_pass"] = entry_trigger_pass
         out["entry_direction"] = entry_direction
-        out["initial_stop"] = initial_stop
         return out
 
     def build_pending_entry_metadata(self, row: pd.Series) -> Dict[str, Any]:
