@@ -1,4 +1,9 @@
-"""Tests for DonchianEntryStrategy."""
+"""Tests for DonchianEntryStrategy (now an alias for HLEntryStrategy).
+
+After the refactor, DonchianEntryConfig/Strategy are thin aliases
+pointing to HLEntryConfig/Strategy. These tests verify backward
+compatibility of the alias imports and the underlying HL behaviour.
+"""
 
 import sys
 from pathlib import Path
@@ -12,6 +17,7 @@ if str(repo_root) not in sys.path:
     sys.path.insert(0, str(repo_root))
 
 from strats.entries.donchian_entry import DonchianEntryConfig, DonchianEntryStrategy
+from strats.entries.hl_entry import HLEntryConfig, HLEntryStrategy
 from strats.helpers import wilder_atr
 
 
@@ -44,37 +50,43 @@ CHANNEL_BARS = [
 ]
 
 
+def test_alias_identity():
+    """DonchianEntryConfig/Strategy are the same classes as HLEntryConfig/Strategy."""
+    assert DonchianEntryConfig is HLEntryConfig
+    assert DonchianEntryStrategy is HLEntryStrategy
+
+
 def test_donchian_long_signal_on_new_high():
     """Close above N-day high triggers a long signal."""
     bars = CHANNEL_BARS + [
-        (101.0, 105.0, 100.5, 104.0),  # close=104 > donchian_high(5)=103
+        (101.0, 105.0, 100.5, 104.0),  # close=104 > channel_high(5)=103
     ]
     df = _make_df(bars)
-    strategy = DonchianEntryStrategy(DonchianEntryConfig(donchian_period=5))
+    strategy = DonchianEntryStrategy(DonchianEntryConfig(period=5))
     result = strategy.prepare_signals(df)
 
     signal_bar = result.iloc[-1]
     assert signal_bar["entry_trigger_pass"] == True
     assert signal_bar["entry_direction"] == 1
     assert pd.notna(signal_bar["initial_stop"])
-    # Stop should be below donchian_low
-    assert signal_bar["initial_stop"] < signal_bar["donchian_low"]
+    # Stop equals channel_low (no ATR buffer in HL)
+    assert signal_bar["initial_stop"] == pytest.approx(signal_bar["channel_low"])
 
 
 def test_donchian_short_signal_on_new_low():
     """Close below N-day low triggers a short signal when allow_short=True."""
     bars = CHANNEL_BARS + [
-        (99.0, 99.5, 95.0, 96.0),  # close=96 < donchian_low(5)=98
+        (99.0, 99.5, 95.0, 96.0),  # close=96 < channel_low(5)=98
     ]
     df = _make_df(bars)
-    strategy = DonchianEntryStrategy(DonchianEntryConfig(donchian_period=5, allow_short=True))
+    strategy = DonchianEntryStrategy(DonchianEntryConfig(period=5, allow_short=True))
     result = strategy.prepare_signals(df)
 
     signal_bar = result.iloc[-1]
     assert signal_bar["entry_trigger_pass"] == True
     assert signal_bar["entry_direction"] == -1
-    # Stop should be above donchian_high
-    assert signal_bar["initial_stop"] > signal_bar["donchian_high"]
+    # Stop equals channel_high (no ATR buffer in HL)
+    assert signal_bar["initial_stop"] == pytest.approx(signal_bar["channel_high"])
 
 
 def test_donchian_no_signal_within_channel():
@@ -83,7 +95,7 @@ def test_donchian_no_signal_within_channel():
         (100.0, 101.0, 99.0, 100.5),  # stays within 98-103 channel
     ]
     df = _make_df(bars)
-    strategy = DonchianEntryStrategy(DonchianEntryConfig(donchian_period=5))
+    strategy = DonchianEntryStrategy(DonchianEntryConfig(period=5))
     result = strategy.prepare_signals(df)
 
     signal_bar = result.iloc[-1]
@@ -97,55 +109,52 @@ def test_donchian_no_short_when_disabled():
         (99.0, 99.5, 95.0, 96.0),
     ]
     df = _make_df(bars)
-    strategy = DonchianEntryStrategy(DonchianEntryConfig(donchian_period=5, allow_short=False))
+    strategy = DonchianEntryStrategy(DonchianEntryConfig(period=5, allow_short=False))
     result = strategy.prepare_signals(df)
 
     signal_bar = result.iloc[-1]
     assert signal_bar["entry_trigger_pass"] == False
 
 
-def test_donchian_stop_uses_atr_buffer():
-    """Initial stop is donchian_low - stop_mult * atr_ref for long."""
+def test_donchian_stop_is_channel_boundary():
+    """Initial stop equals channel_low for long (no ATR buffer in HL)."""
     bars = CHANNEL_BARS + [
         (101.0, 105.0, 100.5, 104.0),
     ]
     df = _make_df(bars)
-    strategy = DonchianEntryStrategy(DonchianEntryConfig(
-        donchian_period=5, initial_stop_atr_mult=2.0,
-    ))
+    strategy = DonchianEntryStrategy(DonchianEntryConfig(period=5))
     result = strategy.prepare_signals(df)
 
     signal_bar = result.iloc[-1]
-    expected_stop = signal_bar["donchian_low"] - 2.0 * signal_bar["atr_ref"]
-    assert signal_bar["initial_stop"] == pytest.approx(expected_stop)
+    assert signal_bar["initial_stop"] == pytest.approx(signal_bar["channel_low"])
 
 
 def test_donchian_metadata():
-    """build_pending_entry_metadata returns donchian_high and donchian_low."""
+    """build_pending_entry_metadata returns channel_high and channel_low."""
     bars = CHANNEL_BARS + [
         (101.0, 105.0, 100.5, 104.0),
     ]
     df = _make_df(bars)
-    strategy = DonchianEntryStrategy(DonchianEntryConfig(donchian_period=5))
+    strategy = DonchianEntryStrategy(DonchianEntryConfig(period=5))
     result = strategy.prepare_signals(df)
 
     signal_bar = result.iloc[-1]
     meta = strategy.build_pending_entry_metadata(signal_bar)
-    assert "donchian_high" in meta
-    assert "donchian_low" in meta
-    assert meta["donchian_high"] == pytest.approx(signal_bar["donchian_high"])
+    assert "channel_high" in meta
+    assert "channel_low" in meta
+    assert meta["channel_high"] == pytest.approx(signal_bar["channel_high"])
 
 
 def test_donchian_with_engine_end_to_end():
-    """Full StrategyEngine run with Donchian entry + HAB exit."""
+    """Full StrategyEngine run with Donchian (HL) entry + HAB exit."""
     from strats.engine import EngineConfig, StrategyEngine
     from strats.exits.hab_exit import HABExitConfig, HABExitStrategy
 
-    # Need enough bars for donchian period + signal + entry + exit
+    # Need enough bars for channel period + signal + entry + exit
     bars = CHANNEL_BARS + [
         (101.0, 105.0, 100.5, 104.0),  # signal day: breakout
         (104.0, 105.0, 103.5, 104.5),  # entry day
-        (104.5, 105.0, 100.0, 100.5),  # close back in channel → struct fail
+        (104.5, 105.0, 100.0, 100.5),  # close back in channel
         (100.5, 101.0, 100.0, 100.8),  # exit day
         (100.8, 101.0, 100.5, 100.9),
     ]
@@ -164,21 +173,21 @@ def test_donchian_with_engine_end_to_end():
             risk_blowout_cap=float("inf"),
             portfolio_risk_cap=1.0, group_risk_cap=1.0,
         ),
-        entry_strategy=DonchianEntryStrategy(DonchianEntryConfig(donchian_period=5)),
+        entry_strategy=DonchianEntryStrategy(DonchianEntryConfig(period=5)),
         exit_strategy=HABExitStrategy(HABExitConfig(structure_fail_bars=15)),
     )
     result = engine.run(df)
 
     total = len(result.trades) + len(result.open_positions)
-    assert total >= 1, "Expected at least one trade or open position from Donchian + HABExit"
+    assert total >= 1, "Expected at least one trade or open position from HL + HABExit"
 
-    # Verify R is set correctly (from Donchian stop, not HAB stop)
+    # Verify R is set correctly (from HL channel stop)
     if len(result.trades) > 0:
         trade = result.trades.iloc[0]
         assert trade["direction"] == 1
         assert trade["r_price"] > 0
-        # Donchian metadata should be in the trade record
-        assert "donchian_high" in trade.index
+        # HL metadata should be in the trade record
+        assert "channel_high" in trade.index
     elif len(result.open_positions) > 0:
         pos = result.open_positions.iloc[0]
         assert pos["direction"] == 1

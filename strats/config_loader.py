@@ -16,8 +16,13 @@ from typing import Any, Dict, List, Optional
 import yaml
 
 from strats.engine import EngineConfig, StrategyEngine, StrategySlot
+from strats.entries.ama_entry import AmaEntryConfig, AmaEntryStrategy
+from strats.entries.boll_break_entry import BollBreakEntryConfig, BollBreakEntryStrategy
 from strats.entries.donchian_entry import DonchianEntryConfig, DonchianEntryStrategy
+from strats.entries.double_ma_entry import DoubleMaEntryConfig, DoubleMaEntryStrategy
 from strats.entries.hab_entry import HABEntryConfig, HABEntryStrategy
+from strats.entries.hl_entry import HLEntryConfig, HLEntryStrategy
+from strats.entries.rand_entry import RandEntryConfig, RandEntryStrategy
 from strats.exits.hab_exit import HABExitConfig, HABExitStrategy
 
 
@@ -68,11 +73,41 @@ def _build_entry(entry_cfg: Dict[str, Any], allow_short: bool) -> Any:
             initial_stop_atr_mult=float(p.get("initial_stop_atr_mult", 0.4)),
             allow_short=allow_short,
         ))
-    elif entry_type == "donchian":
-        p = entry_cfg.get("donchian", {})
-        return DonchianEntryStrategy(DonchianEntryConfig(
-            donchian_period=int(p.get("donchian_period", 20)),
-            initial_stop_atr_mult=float(p.get("initial_stop_atr_mult", 2.0)),
+    elif entry_type in ("donchian", "hl"):
+        # "donchian" kept for backward compat; both map to HLEntryStrategy
+        p = entry_cfg.get(entry_type, {})
+        return HLEntryStrategy(HLEntryConfig(
+            period=int(p.get("period", p.get("donchian_period", 20))),
+            allow_short=allow_short,
+        ))
+    elif entry_type == "boll":
+        p = entry_cfg.get("boll", {})
+        return BollBreakEntryStrategy(BollBreakEntryConfig(
+            period=int(p.get("period", 22)),
+            k=float(p.get("k", 2.0)),
+            allow_short=allow_short,
+        ))
+    elif entry_type == "ama":
+        p = entry_cfg.get("ama", {})
+        return AmaEntryStrategy(AmaEntryConfig(
+            n=int(p.get("n", 10)),
+            fast_period=int(p.get("fast_period", 2)),
+            slow_period=int(p.get("slow_period", 30)),
+            stop_atr_mult=float(p.get("stop_atr_mult", 2.0)),
+            allow_short=allow_short,
+        ))
+    elif entry_type == "double_ma":
+        p = entry_cfg.get("double_ma", {})
+        return DoubleMaEntryStrategy(DoubleMaEntryConfig(
+            fast=int(p.get("fast", 13)),
+            slow=int(p.get("slow", 34)),
+            allow_short=allow_short,
+        ))
+    elif entry_type == "rand":
+        p = entry_cfg.get("rand", {})
+        return RandEntryStrategy(RandEntryConfig(
+            seed=int(p.get("seed", 42)),
+            stop_atr_mult=float(p.get("stop_atr_mult", 2.0)),
             allow_short=allow_short,
         ))
     else:
