@@ -65,6 +65,7 @@ class RQDataFuturesResearchAdapter:
         "commission",
         "slippage",
         "group_name",
+        "margin_rate",
     ]
 
     def __init__(
@@ -116,6 +117,11 @@ class RQDataFuturesResearchAdapter:
                     else meta.slippage
                 ),
                 "group_name": meta.group_name,
+                "margin_rate": float(
+                    df["margin_rate"].iloc[0]
+                    if "margin_rate" in df.columns and pd.notna(df["margin_rate"].iloc[0])
+                    else meta.margin_rate
+                ),
             }
         )
 
