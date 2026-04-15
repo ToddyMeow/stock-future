@@ -45,12 +45,25 @@ def load_config(path: Optional[str] = None) -> Dict[str, Any]:
 def build_engine_config(cfg: Dict[str, Any]) -> EngineConfig:
     """Build EngineConfig from the 'engine' section."""
     e = cfg.get("engine", {})
+    raw_group_risk_cap = e.get("group_risk_cap", {})
+    if isinstance(raw_group_risk_cap, dict):
+        group_risk_cap = {k: float(v) for k, v in raw_group_risk_cap.items()}
+    else:
+        # Backward compat: scalar → apply to all default groups
+        cap = float(raw_group_risk_cap)
+        group_risk_cap = {g: cap for g in [
+            "equity_index", "bond", "chem_energy", "rubber_fiber",
+            "metals", "black_steel", "agri", "building", "livestock",
+        ]}
+
     return EngineConfig(
         initial_capital=float(e.get("initial_capital", 1_000_000)),
         atr_period=int(e.get("atr_period", 20)),
         risk_per_trade=float(e.get("risk_per_trade", 0.02)),
         portfolio_risk_cap=float(e.get("portfolio_risk_cap", 0.12)),
-        group_risk_cap=float(e.get("group_risk_cap", 0.06)),
+        group_risk_cap=group_risk_cap,
+        default_group_risk_cap=float(e.get("default_group_risk_cap", 0.02)),
+        independent_group_soft_cap=float(e.get("independent_group_soft_cap", 0.08)),
         max_portfolio_leverage=float(e.get("max_portfolio_leverage", 3.0)),
         default_margin_rate=float(e.get("default_margin_rate", 0.10)),
         risk_blowout_cap=float(e.get("risk_blowout_cap", 1.5)),

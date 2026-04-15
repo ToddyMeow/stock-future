@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, FrozenSet, List, Literal, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -53,7 +53,13 @@ class EngineConfig:
     initial_capital: float = 1_000_000.0
     risk_per_trade: float = 0.02
     portfolio_risk_cap: float = 0.12
-    group_risk_cap: float = 0.06
+    group_risk_cap: Dict[str, float] = field(default_factory=lambda: {
+        "equity_index": 0.04, "bond": 0.04,
+        "chem_energy": 0.06, "rubber_fiber": 0.06, "metals": 0.06,
+        "black_steel": 0.06, "agri": 0.06, "building": 0.05, "livestock": 0.04,
+    })
+    default_group_risk_cap: float = 0.02
+    independent_group_soft_cap: float = 0.08
     max_portfolio_leverage: float = 3.0
     default_margin_rate: float = 0.10
 
@@ -68,6 +74,9 @@ class EngineConfig:
     risk_blowout_cap: float = 1.5
     risk_blowout_action: Literal["SHRINK", "CANCEL"] = "SHRINK"
     allow_short: bool = False
+
+    # Symbol exclusion
+    exclude_symbols: FrozenSet[str] = frozenset()
 
     eps: float = 1e-12
 
@@ -243,6 +252,10 @@ class StrategyEngine:
             df[cfg.margin_rate_col] = cfg.default_margin_rate
 
         self._validate_input_values(df)
+
+        # Filter out excluded symbols.
+        if cfg.exclude_symbols:
+            df = df[~df[cfg.symbol_col].isin(cfg.exclude_symbols)].copy()
 
         # Fix 3: Gap audit -- warn about suspicious data gaps per symbol.
         self._gap_diagnostics = []
@@ -553,7 +566,10 @@ class StrategyEngine:
                                     )
                                 )
                                 portfolio_cap = equity_close * cfg.portfolio_risk_cap
-                                group_cap = equity_close * cfg.group_risk_cap
+                                if group_name.startswith("ind_"):
+                                    group_cap = equity_close * cfg.default_group_risk_cap
+                                else:
+                                    group_cap = equity_close * cfg.group_risk_cap.get(group_name, cfg.default_group_risk_cap)
                                 portfolio_risk_if_filled = effective_open_risk + order_risk
                                 group_risk_if_filled = effective_open_risk_by_group.get(group_name, 0.0) + order_risk
 
@@ -565,9 +581,15 @@ class StrategyEngine:
                                     reason = "PORTFOLIO_RISK_CAP"
                                 elif group_risk_if_filled > group_cap + cfg.eps:
                                     reason = "GROUP_RISK_CAP"
-                                elif equity_close > cfg.eps and total_notional_if_filled / equity_close > cfg.max_portfolio_leverage:
+                                elif group_name.startswith("ind_"):
+                                    ind_risk = sum(r for g, r in effective_open_risk_by_group.items() if g.startswith("ind_"))
+                                    if ind_risk + order_risk > equity_close * cfg.independent_group_soft_cap + cfg.eps:
+                                        reason = "INDEPENDENT_SOFT_CAP"
+
+                                if reason is None and equity_close > cfg.eps and total_notional_if_filled / equity_close > cfg.max_portfolio_leverage:
                                     reason = "LEVERAGE_CAP"
-                                else:
+
+                                if reason is None:
                                     pending_entries[key] = PendingEntry(
                                         symbol=symbol,
                                         strategy_id=slot.strategy_id,

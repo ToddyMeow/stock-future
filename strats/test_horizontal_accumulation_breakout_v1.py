@@ -1,17 +1,15 @@
 
 import json
 import math
+from dataclasses import fields
 
 import pandas as pd
 import pytest
 
-from horizontal_accumulation_breakout_v1 import (
-    HABConfig,
-    HorizontalAccumulationBreakoutV1,
-    PortfolioAnalyzer,
-    detect_hlh_pattern,
-    detect_lhl_pattern,
-)
+from strats.engine import EngineConfig, StrategyEngine
+from strats.entries.hab_entry import HABEntryConfig, HABEntryStrategy
+from strats.exits.hab_exit import HABExitConfig, HABExitStrategy
+from strats.helpers import PortfolioAnalyzer, detect_hlh_pattern, detect_lhl_pattern
 
 
 BASE_BARS = [
@@ -26,20 +24,40 @@ BASE_BARS = [
 ]
 
 
-def make_test_config(**overrides) -> HABConfig:
-    base = dict(
-        initial_capital=100_000,
-        atr_period=3,
-        bb_period=3,
-        bb_percentile_lookback=5,
-        bb_percentile_threshold=1.0,
-        portfolio_risk_cap=1.0,
-        group_risk_cap=1.0,
-        risk_blowout_cap=float("inf"),
-        initial_stop_atr_mult=100.0,
+def make_test_engine(**overrides) -> StrategyEngine:
+    engine_defaults = dict(
+        initial_capital=100_000, atr_period=3,
+        risk_blowout_cap=float("inf"), stop_atr_mult=100.0,
+        portfolio_risk_cap=1.0, group_risk_cap={"default": 1.0},
+        default_group_risk_cap=1.0, independent_group_soft_cap=1.0,
     )
-    base.update(overrides)
-    return HABConfig(**base)
+    entry_defaults = dict(
+        bb_period=3, bb_percentile_lookback=5, bb_percentile_threshold=1.0,
+    )
+    exit_defaults = dict()
+
+    # Split overrides by target
+    engine_keys = {f.name for f in fields(EngineConfig)}
+    entry_keys = {f.name for f in fields(HABEntryConfig)}
+    exit_keys = {f.name for f in fields(HABExitConfig)}
+
+    engine_overrides = {k: v for k, v in overrides.items() if k in engine_keys}
+    entry_overrides = {k: v for k, v in overrides.items() if k in entry_keys}
+    exit_overrides = {k: v for k, v in overrides.items() if k in exit_keys}
+
+    # Handle legacy: initial_stop_atr_mult -> stop_atr_mult
+    if 'initial_stop_atr_mult' in overrides:
+        engine_overrides['stop_atr_mult'] = overrides['initial_stop_atr_mult']
+
+    engine_cfg = EngineConfig(**{**engine_defaults, **engine_overrides})
+    entry_cfg = HABEntryConfig(**{**entry_defaults, **entry_overrides})
+    exit_cfg = HABExitConfig(**{**exit_defaults, **exit_overrides})
+
+    return StrategyEngine(
+        config=engine_cfg,
+        entry_strategy=HABEntryStrategy(entry_cfg),
+        exit_strategy=HABExitStrategy(exit_cfg),
+    )
 
 
 def make_symbol_frame(bars, symbol="A", group="G1", start="2025-01-01") -> pd.DataFrame:
@@ -99,9 +117,7 @@ def test_bandwidth_uses_positive_denominator_when_bb_mid_is_negative() -> None:
         (-9.7, -9.2, -10.0, -9.5),
     ]
     df = make_symbol_frame(bars, symbol="NEG", group="GN", start="2025-01-01")
-    engine = HorizontalAccumulationBreakoutV1(
-        make_test_config(atr_period=3, bb_period=3, bb_percentile_lookback=3)
-    )
+    engine = make_test_engine(atr_period=3, bb_period=3, bb_percentile_lookback=3)
     prepared = engine.prepare_data(df)
 
     finite_denom = prepared["bandwidth_denom"].dropna()
@@ -121,7 +137,7 @@ def test_structure_fail_exits_next_open_after_close_back_into_box() -> None:
             (101.0, 101.5, 100.8, 101.3),
         ]
     )
-    engine = HorizontalAccumulationBreakoutV1(make_test_config())
+    engine = make_test_engine()
     result = engine.run(df)
 
     assert len(result.trades) == 1
@@ -145,7 +161,7 @@ def test_time_fail_exits_next_open_after_five_completed_bars_without_half_r() ->
         ],
         start="2025-02-03",
     )
-    engine = HorizontalAccumulationBreakoutV1(make_test_config())
+    engine = make_test_engine()
     result = engine.run(df)
 
     assert len(result.trades) == 1
@@ -165,7 +181,7 @@ def test_gap_open_below_stop_exits_at_open_price_not_at_stop() -> None:
         ],
         start="2025-03-03",
     )
-    engine = HorizontalAccumulationBreakoutV1(make_test_config(initial_stop_atr_mult=3.0))
+    engine = make_test_engine(initial_stop_atr_mult=3.0)
     result = engine.run(df)
 
     assert len(result.trades) == 1
@@ -177,7 +193,8 @@ def test_gap_open_below_stop_exits_at_open_price_not_at_stop() -> None:
 
 
 def test_position_size_is_frozen_from_signal_close_not_next_open() -> None:
-    cfg = make_test_config()
+    engine = make_test_engine()
+    cfg = engine.config
     df = make_frame(
         [
             (110.0, 110.5, 109.5, 109.8),
@@ -185,7 +202,6 @@ def test_position_size_is_frozen_from_signal_close_not_next_open() -> None:
         ],
         start="2025-04-01",
     )
-    engine = HorizontalAccumulationBreakoutV1(cfg)
     result = engine.run(df)
 
     assert result.trades.empty
@@ -215,7 +231,7 @@ def test_active_stop_series_records_computed_and_effective_dates() -> None:
         ],
         start="2025-04-21",
     )
-    engine = HorizontalAccumulationBreakoutV1(make_test_config())
+    engine = make_test_engine()
     result = engine.run(df)
 
     position = result.open_positions.iloc[0]
@@ -238,7 +254,7 @@ def test_cancel_entry_when_open_below_initial_stop() -> None:
         ],
         start="2025-05-01",
     )
-    engine = HorizontalAccumulationBreakoutV1(make_test_config(initial_stop_atr_mult=3.0))
+    engine = make_test_engine(initial_stop_atr_mult=3.0)
     result = engine.run(df)
 
     assert result.trades.empty
@@ -253,7 +269,7 @@ def test_cancel_entry_when_open_below_initial_stop() -> None:
 
 
 def test_pending_next_open_exit_releases_risk_budget() -> None:
-    cfg = make_test_config(portfolio_risk_cap=0.025, group_risk_cap=1.0)
+    engine = make_test_engine(portfolio_risk_cap=0.025, group_risk_cap={"default": 1.0}, default_group_risk_cap=1.0)
 
     symbol_a = make_frame(
         [
@@ -276,7 +292,6 @@ def test_pending_next_open_exit_releases_risk_budget() -> None:
     symbol_b = make_symbol_frame(symbol_b_bars, symbol="B", group="GB", start="2025-06-02")
 
     df = pd.concat([symbol_a, symbol_b], ignore_index=True)
-    engine = HorizontalAccumulationBreakoutV1(cfg)
     result = engine.run(df)
 
     assert len(result.trades) == 1
@@ -314,7 +329,7 @@ def test_actual_fill_risk_blowout_is_logged() -> None:
         ],
         start="2025-07-01",
     )
-    engine = HorizontalAccumulationBreakoutV1(make_test_config())
+    engine = make_test_engine()
     result = engine.run(df)
 
     assert len(result.trades) == 1
@@ -333,7 +348,7 @@ def test_invalid_ohlc_input_raises() -> None:
     df = make_frame([], start="2025-08-01")
     df.loc[0, "high"] = 99.0  # below open=99.5 and close=100.0
 
-    engine = HorizontalAccumulationBreakoutV1(make_test_config())
+    engine = make_test_engine()
     with pytest.raises(ValueError):
         engine.prepare_data(df)
 
@@ -346,7 +361,7 @@ def test_entry_bar_intraday_stop_after_fill() -> None:
         ],
         start="2025-09-01",
     )
-    engine = HorizontalAccumulationBreakoutV1(make_test_config(initial_stop_atr_mult=3.0))
+    engine = make_test_engine(initial_stop_atr_mult=3.0)
     result = engine.run(df)
 
     assert len(result.trades) == 1
@@ -369,9 +384,7 @@ def test_risk_blowout_cancel_when_gap_exceeds_cap() -> None:
         ],
         start="2025-10-01",
     )
-    engine = HorizontalAccumulationBreakoutV1(
-        make_test_config(risk_blowout_cap=1.2, risk_blowout_action="CANCEL", initial_stop_atr_mult=3.0)
-    )
+    engine = make_test_engine(risk_blowout_cap=1.2, risk_blowout_action="CANCEL", initial_stop_atr_mult=3.0)
     result = engine.run(df)
 
     assert len(result.trades) == 0
@@ -389,9 +402,7 @@ def test_risk_blowout_shrink_reduces_qty() -> None:
         ],
         start="2025-10-01",
     )
-    engine = HorizontalAccumulationBreakoutV1(
-        make_test_config(risk_blowout_cap=1.2, risk_blowout_action="SHRINK", initial_stop_atr_mult=3.0)
-    )
+    engine = make_test_engine(risk_blowout_cap=1.2, risk_blowout_action="SHRINK", initial_stop_atr_mult=3.0)
     result = engine.run(df)
 
     assert len(result.trades) == 1
@@ -415,9 +426,7 @@ def test_risk_blowout_shrink_to_zero_cancels() -> None:
         ],
         start="2025-10-01",
     )
-    engine = HorizontalAccumulationBreakoutV1(
-        make_test_config(initial_capital=300, risk_blowout_cap=1.01, risk_blowout_action="SHRINK", initial_stop_atr_mult=3.0)
-    )
+    engine = make_test_engine(initial_capital=300, risk_blowout_cap=1.01, risk_blowout_action="SHRINK", initial_stop_atr_mult=3.0)
     result = engine.run(df)
 
     assert len(result.trades) == 0
@@ -435,9 +444,7 @@ def test_blowout_within_cap_proceeds_normally() -> None:
         ],
         start="2025-10-01",
     )
-    engine = HorizontalAccumulationBreakoutV1(
-        make_test_config(risk_blowout_cap=1.5)
-    )
+    engine = make_test_engine(risk_blowout_cap=1.5)
     result = engine.run(df)
 
     assert len(result.trades) == 1
@@ -499,7 +506,7 @@ def test_short_entry_breakout_below_box() -> None:
         ],
         start="2025-11-01",
     )
-    engine = HorizontalAccumulationBreakoutV1(make_test_config(allow_short=True))
+    engine = make_test_engine(allow_short=True)
     result = engine.run(df)
 
     # Should have a short position (either open or traded)
@@ -525,7 +532,7 @@ def test_short_entry_fill_uses_open_minus_slippage() -> None:
     )
     # Use non-zero slippage to verify
     df["slippage"] = 0.5
-    engine = HorizontalAccumulationBreakoutV1(make_test_config(allow_short=True))
+    engine = make_test_engine(allow_short=True)
     result = engine.run(df)
 
     total = len(result.trades) + len(result.open_positions)
@@ -554,7 +561,7 @@ def test_short_pnl_positive_when_price_drops() -> None:
         ],
         start="2025-11-01",
     )
-    engine = HorizontalAccumulationBreakoutV1(make_test_config(allow_short=True))
+    engine = make_test_engine(allow_short=True)
     result = engine.run(df)
 
     assert len(result.trades) >= 1, "Expected at least one closed short trade"
@@ -574,7 +581,7 @@ def test_short_gap_stop_exits_when_open_above_stop() -> None:
         ],
         start="2025-11-01",
     )
-    engine = HorizontalAccumulationBreakoutV1(make_test_config(allow_short=True, initial_stop_atr_mult=3.0))
+    engine = make_test_engine(allow_short=True, initial_stop_atr_mult=3.0)
     result = engine.run(df)
 
     assert len(result.trades) >= 1, "Expected a STOP_GAP trade"
@@ -595,7 +602,7 @@ def test_short_struct_fail_close_above_box_low() -> None:
         ],
         start="2025-11-01",
     )
-    engine = HorizontalAccumulationBreakoutV1(make_test_config(allow_short=True))
+    engine = make_test_engine(allow_short=True)
     result = engine.run(df)
 
     assert len(result.trades) >= 1, "Expected a STRUCT_FAIL trade"
@@ -613,7 +620,7 @@ def test_allow_short_false_no_short_signals() -> None:
         ],
         start="2025-11-01",
     )
-    engine = HorizontalAccumulationBreakoutV1(make_test_config(allow_short=False))
+    engine = make_test_engine(allow_short=False)
     result = engine.run(df)
 
     assert len(result.trades) == 0
@@ -635,9 +642,7 @@ def test_struct_fail_consecutive_mode_single_bar_does_not_trigger() -> None:
         ],
         start="2025-12-01",
     )
-    engine = HorizontalAccumulationBreakoutV1(
-        make_test_config(structure_fail_mode="CONSECUTIVE_CLOSE", structure_fail_consecutive=2)
-    )
+    engine = make_test_engine(structure_fail_mode="CONSECUTIVE_CLOSE", structure_fail_consecutive=2)
     result = engine.run(df)
 
     # Should NOT have struct fail exit (only 1 consecutive fail, then reset)
@@ -657,9 +662,7 @@ def test_struct_fail_consecutive_mode_triggers_after_n_bars() -> None:
         ],
         start="2025-12-01",
     )
-    engine = HorizontalAccumulationBreakoutV1(
-        make_test_config(structure_fail_mode="CONSECUTIVE_CLOSE", structure_fail_consecutive=2)
-    )
+    engine = make_test_engine(structure_fail_mode="CONSECUTIVE_CLOSE", structure_fail_consecutive=2)
     result = engine.run(df)
 
     assert len(result.trades) == 1
@@ -680,9 +683,7 @@ def test_struct_fail_atr_buffer_mode_tolerates_slight_return() -> None:
         ],
         start="2025-12-01",
     )
-    engine = HorizontalAccumulationBreakoutV1(
-        make_test_config(structure_fail_mode="CLOSE_BELOW_BOX_MINUS_ATR", structure_fail_atr_buffer=0.5)
-    )
+    engine = make_test_engine(structure_fail_mode="CLOSE_BELOW_BOX_MINUS_ATR", structure_fail_atr_buffer=0.5)
     result = engine.run(df)
 
     # Should NOT trigger struct fail (close is above box_high - 0.5*ATR)
@@ -704,9 +705,7 @@ def test_leverage_cap_rejects_entry() -> None:
     )
     # With multiplier=1, capital=100k, qty~371, notional=103*1*371=38213.
     # Set a very low leverage cap so 38213/100000 = 0.38 exceeds cap 0.01.
-    engine = HorizontalAccumulationBreakoutV1(
-        make_test_config(max_portfolio_leverage=0.01)
-    )
+    engine = make_test_engine(max_portfolio_leverage=0.01)
     result = engine.run(df)
 
     # The entry should be rejected with LEVERAGE_CAP
@@ -727,9 +726,7 @@ def test_leverage_cap_allows_within_limit() -> None:
         ],
         start="2025-12-01",
     )
-    engine = HorizontalAccumulationBreakoutV1(
-        make_test_config(max_portfolio_leverage=100.0)  # very high cap
-    )
+    engine = make_test_engine(max_portfolio_leverage=100.0)  # very high cap
     result = engine.run(df)
 
     assert len(result.trades) == 1
@@ -744,7 +741,7 @@ def test_leverage_tracked_in_portfolio_daily() -> None:
         ],
         start="2025-12-01",
     )
-    engine = HorizontalAccumulationBreakoutV1(make_test_config())
+    engine = make_test_engine()
     result = engine.run(df)
 
     assert "total_notional" in result.portfolio_daily.columns
@@ -764,7 +761,7 @@ def test_missing_margin_rate_uses_default() -> None:
     if "margin_rate" in df.columns:
         df = df.drop(columns=["margin_rate"])
 
-    engine = HorizontalAccumulationBreakoutV1(make_test_config())
+    engine = make_test_engine()
     result = engine.run(df)
 
     # Should run without error
@@ -787,10 +784,9 @@ def test_analyzer_equity_curve_drawdown() -> None:
         ],
         start="2025-12-01",
     )
-    cfg = make_test_config()
-    engine = HorizontalAccumulationBreakoutV1(cfg)
+    engine = make_test_engine()
     result = engine.run(df)
-    analyzer = PortfolioAnalyzer(result, cfg)
+    analyzer = PortfolioAnalyzer(result, engine.config)
     ec = analyzer.equity_curve()
 
     assert "drawdown" in ec.columns
@@ -827,10 +823,9 @@ def test_analyzer_group_contribution() -> None:
         group="G2",
     )
     df = pd.concat([bars_a, bars_b], ignore_index=True)
-    cfg = make_test_config()
-    engine = HorizontalAccumulationBreakoutV1(cfg)
+    engine = make_test_engine()
     result = engine.run(df)
-    analyzer = PortfolioAnalyzer(result, cfg)
+    analyzer = PortfolioAnalyzer(result, engine.config)
     gc = analyzer.group_contribution()
 
     assert len(gc) >= 1
@@ -849,10 +844,9 @@ def test_analyzer_summary_stats() -> None:
         ],
         start="2025-12-01",
     )
-    cfg = make_test_config()
-    engine = HorizontalAccumulationBreakoutV1(cfg)
+    engine = make_test_engine()
     result = engine.run(df)
-    analyzer = PortfolioAnalyzer(result, cfg)
+    analyzer = PortfolioAnalyzer(result, engine.config)
     stats = analyzer.summary_stats()
 
     assert "total_return" in stats

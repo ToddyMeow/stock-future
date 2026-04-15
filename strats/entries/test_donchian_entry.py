@@ -153,7 +153,8 @@ def test_donchian_with_engine_end_to_end():
         config=EngineConfig(
             initial_capital=100_000, atr_period=3,
             risk_blowout_cap=float("inf"),
-            portfolio_risk_cap=1.0, group_risk_cap=1.0,
+            portfolio_risk_cap=1.0, group_risk_cap={"default": 1.0},
+            default_group_risk_cap=1.0, independent_group_soft_cap=1.0,
         ),
         entry_strategy=DonchianEntryStrategy(DonchianEntryConfig(period=5)),
         exit_strategy=HABExitStrategy(HABExitConfig(structure_fail_bars=15)),

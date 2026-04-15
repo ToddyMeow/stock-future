@@ -18,7 +18,18 @@ engine:
   # 风控
   risk_per_trade: 0.02
   portfolio_risk_cap: 0.15
-  group_risk_cap: 0.06
+  group_risk_cap:
+    equity_index: 0.04
+    bond: 0.04
+    chem_energy: 0.06
+    rubber_fiber: 0.06
+    metals: 0.06
+    black_steel: 0.06
+    agri: 0.06
+    building: 0.05
+    livestock: 0.04
+  default_group_risk_cap: 0.02
+  independent_group_soft_cap: 0.08
   max_portfolio_leverage: 3.0
   default_margin_rate: 0.10
 

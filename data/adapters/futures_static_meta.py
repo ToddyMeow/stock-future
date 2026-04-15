@@ -34,32 +34,54 @@ PRODUCT_GROUP_MAP = {
     "government bond": "rate",
 }
 
+FUTURES_GROUP_MAP = {
+    "BU":"chem_energy","EB":"chem_energy","EG":"chem_energy","FU":"chem_energy",
+    "L":"chem_energy","MA":"chem_energy","PF":"chem_energy","PG":"chem_energy",
+    "PP":"chem_energy","SC":"chem_energy","TA":"chem_energy","V":"chem_energy",
+    "CF":"rubber_fiber","CY":"rubber_fiber","RU":"rubber_fiber","SR":"rubber_fiber",
+    "I":"black_steel","J":"black_steel","JM":"black_steel","RB":"black_steel","ZC":"black_steel","SF":"black_steel",
+    "FG":"building","SA":"building","SP":"building","AO":"building","LC":"building",
+    "SI":"building","SH":"building","SM":"building","UR":"building","WR":"building",
+    "IC":"equity_index","IF":"equity_index","IM":"equity_index",
+    "AG":"metals","AL":"metals","AU":"metals","CU":"metals","NI":"metals",
+    "PB":"metals","SN":"metals","SS":"metals","ZN":"metals",
+    "T":"bond","TL":"bond","TS":"bond",
+    "A":"agri","B":"agri","C":"agri","CS":"agri","M":"agri","OI":"agri",
+    "P":"agri","PK":"agri","RM":"agri","RS":"agri","Y":"agri",
+    "JD":"livestock","LH":"livestock",
+    "AP":"ind_AP","BB":"ind_BB","CJ":"ind_CJ","EC":"ind_EC","FB":"ind_FB",
+    "JR":"ind_JR","LR":"ind_LR","LU":"ind_LU","PM":"ind_PM","RI":"ind_RI",
+    "RR":"ind_RR","WH":"ind_WH",
+}
+
+EXCLUDED_SYMBOLS = {"BC","PR","PX","NR","HC","IH","TF","BR","LG","AD","BZ","OP","PD","PT","PP_F","V_F","L_F"}
+
 FUTURES_META_OVERRIDES: Dict[str, FuturesMeta] = {
     # 黑色
-    "RB": FuturesMeta(commission=3.0, slippage=1.0, group_name="black"),
-    "I": FuturesMeta(commission=6.0, slippage=1.0, group_name="black"),
-    "J": FuturesMeta(commission=12.0, slippage=1.0, group_name="black"),
-    "JM": FuturesMeta(commission=6.0, slippage=1.0, group_name="black"),
+    "RB": FuturesMeta(commission=3.0, slippage=1.0, group_name="black_steel"),
+    "I": FuturesMeta(commission=6.0, slippage=1.0, group_name="black_steel"),
+    "J": FuturesMeta(commission=12.0, slippage=1.0, group_name="black_steel"),
+    "JM": FuturesMeta(commission=6.0, slippage=1.0, group_name="black_steel"),
 
     # 能化
-    "SC": FuturesMeta(commission=20.0, slippage=0.5, group_name="energy"),
-    "MA": FuturesMeta(commission=3.0, slippage=1.0, group_name="chem"),
+    "SC": FuturesMeta(commission=20.0, slippage=0.5, group_name="chem_energy"),
+    "MA": FuturesMeta(commission=3.0, slippage=1.0, group_name="chem_energy"),
 
     # 农产品
     "M": FuturesMeta(commission=3.0, slippage=1.0, group_name="agri"),
     "Y": FuturesMeta(commission=3.0, slippage=2.0, group_name="agri"),
 
     # 有色
-    "CU": FuturesMeta(commission=6.0, slippage=10.0, group_name="base_metal"),
+    "CU": FuturesMeta(commission=6.0, slippage=10.0, group_name="metals"),
 
     # 贵金属
-    "AU": FuturesMeta(commission=10.0, slippage=0.05, group_name="precious"),
+    "AU": FuturesMeta(commission=10.0, slippage=0.05, group_name="metals"),
 
     # 金融
-    "IF": FuturesMeta(commission=25.0, slippage=0.4, group_name="index"),
-    "IC": FuturesMeta(commission=25.0, slippage=0.4, group_name="index"),
-    "IH": FuturesMeta(commission=25.0, slippage=0.4, group_name="index"),
-    "IM": FuturesMeta(commission=25.0, slippage=0.4, group_name="index"),
+    "IF": FuturesMeta(commission=25.0, slippage=0.4, group_name="equity_index"),
+    "IC": FuturesMeta(commission=25.0, slippage=0.4, group_name="equity_index"),
+    "IH": FuturesMeta(commission=25.0, slippage=0.4, group_name="equity_index"),
+    "IM": FuturesMeta(commission=25.0, slippage=0.4, group_name="equity_index"),
 }
 
 
@@ -70,6 +92,13 @@ def infer_group_name(
     product: Optional[str] = None,
 ) -> str:
     key = underlying_symbol.upper()
+
+    # 1. Explicit group map (most specific)
+    group = FUTURES_GROUP_MAP.get(key)
+    if group is not None:
+        return group
+
+    # 2. Meta overrides (commission/slippage layer)
     override = FUTURES_META_OVERRIDES.get(key)
     if override is not None:
         return override.group_name
