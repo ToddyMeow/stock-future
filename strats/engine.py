@@ -65,12 +65,29 @@ class EngineConfig:
     risk_blowout_action: Literal["SHRINK", "CANCEL"] = "SHRINK"
     allow_short: bool = False
 
+    # Drawdown circuit breaker: stop opening new positions when portfolio
+    # drawdown from equity peak exceeds this threshold (e.g. 0.15 = -15%).
+    # Resumes when drawdown recovers above resume threshold (default: half of halt).
+    # Set halt to 1.0 to disable.
+    max_drawdown_halt: float = 1.0
+    drawdown_resume: float = 0.05
+
     eps: float = 1e-12
+
+
+@dataclass
+class StrategySlot:
+    """Pairs one entry strategy with one exit strategy under a unique ID."""
+
+    strategy_id: str
+    entry_strategy: Any
+    exit_strategy: Any
 
 
 @dataclass
 class PendingEntry:
     symbol: str
+    strategy_id: str
     group_name: str
     direction: int  # 1=long, -1=short
     signal_date: pd.Timestamp
@@ -90,6 +107,7 @@ class PendingEntry:
 @dataclass
 class Position:
     symbol: str
+    strategy_id: str
     group_name: str
     direction: int  # 1=long, -1=short
     signal_date: pd.Timestamp
@@ -154,12 +172,23 @@ class StrategyEngine:
     def __init__(
         self,
         config: EngineConfig,
-        entry_strategy: Any,
-        exit_strategy: Any,
+        strategies: Optional[List[StrategySlot]] = None,
+        # Backward compat: single entry/exit
+        entry_strategy: Any = None,
+        exit_strategy: Any = None,
     ) -> None:
         self.config = config
-        self._entry_strategy = entry_strategy
-        self._exit_strategy = exit_strategy
+        # If old-style single strategy, wrap in StrategySlot
+        if strategies is not None:
+            self._strategies = strategies
+        elif entry_strategy is not None and exit_strategy is not None:
+            self._strategies = [StrategySlot("default", entry_strategy, exit_strategy)]
+        else:
+            raise ValueError("Provide either 'strategies' list or 'entry_strategy'+'exit_strategy'")
+        self._strategy_map: Dict[str, StrategySlot] = {s.strategy_id: s for s in self._strategies}
+        # Backward-compat aliases (first strategy)
+        self._entry_strategy = self._strategies[0].entry_strategy
+        self._exit_strategy = self._strategies[0].exit_strategy
         self._gap_diagnostics: List[Dict[str, Any]] = []
 
     def prepare_data(self, bars: pd.DataFrame) -> pd.DataFrame:
@@ -247,7 +276,12 @@ class StrategyEngine:
 
     def run(self, bars: pd.DataFrame) -> BacktestResult:
         cfg = self.config
-        prepared = self.prepare_data(bars)
+        prepared_by_strategy = self._prepare_all_strategies(bars)
+
+        # Use the first strategy's prepared data for backward compat
+        # (daily_status, prepared_data in result, and date extraction)
+        first_strategy_id = self._strategies[0].strategy_id
+        prepared = prepared_by_strategy[first_strategy_id]
 
         if prepared.empty:
             return BacktestResult(
@@ -273,20 +307,33 @@ class StrategyEngine:
             )
 
         dates = list(pd.Index(prepared[cfg.date_col]).drop_duplicates().sort_values())
+
+        # Pre-index rows by date for the first strategy (used for phases 1-4)
         rows_by_date: Dict[pd.Timestamp, pd.DataFrame] = {
             date: day_df.sort_values(cfg.symbol_col).reset_index(drop=True)
             for date, day_df in prepared.groupby(cfg.date_col, sort=True)
         }
 
-        positions: Dict[str, Position] = {}
-        pending_entries: Dict[str, PendingEntry] = {}
+        # Pre-index rows by date per strategy (for signal generation)
+        rows_by_date_by_strategy: Dict[str, Dict[pd.Timestamp, pd.DataFrame]] = {}
+        for sid, sp in prepared_by_strategy.items():
+            rows_by_date_by_strategy[sid] = {
+                date: day_df.sort_values(cfg.symbol_col).reset_index(drop=True)
+                for date, day_df in sp.groupby(cfg.date_col, sort=True)
+            }
+
+        PositionKey = Tuple[str, str]  # (symbol, strategy_id)
+        positions: Dict[PositionKey, Position] = {}
+        pending_entries: Dict[PositionKey, PendingEntry] = {}
         closed_trades: List[Dict[str, Any]] = []
         cancelled_entries: List[Dict[str, Any]] = []
         portfolio_daily: List[Dict[str, Any]] = []
-        risk_reject: Dict[Tuple[pd.Timestamp, str], Optional[str]] = {}
+        risk_reject: Dict[Tuple[pd.Timestamp, str, str], Optional[str]] = {}  # (date, symbol, strategy_id)
         last_close_by_symbol: Dict[str, float] = {}
 
         cash = float(cfg.initial_capital)
+        equity_peak = float(cfg.initial_capital)
+        in_drawdown_halt = False
 
         for date in dates:
             day_df = rows_by_date[date]
@@ -298,118 +345,124 @@ class StrategyEngine:
             # 1) Existing positions: open-gap stop, pending open exits, intraday stop.
             for _, row in day_df.iterrows():
                 symbol = str(row[cfg.symbol_col])
-                if symbol not in positions:
-                    continue
-                position = positions[symbol]
-                exit_record = self._process_open_and_intraday_for_existing_position(
-                    position=position,
-                    row=row,
-                )
-                if exit_record is not None:
-                    cash += float(exit_record.pop("cash_delta"))
-                    closed_trades.append(exit_record)
-                    del positions[symbol]
+                keys_for_symbol = [k for k in positions if k[0] == symbol]
+                for key in keys_for_symbol:
+                    position = positions[key]
+                    exit_record = self._process_open_and_intraday_for_existing_position(
+                        position=position,
+                        row=row,
+                    )
+                    if exit_record is not None:
+                        cash += float(exit_record.pop("cash_delta"))
+                        closed_trades.append(exit_record)
+                        del positions[key]
 
             # 2) Pending entries fill at today's open.
             for _, row in day_df.iterrows():
                 symbol = str(row[cfg.symbol_col])
-                pending = pending_entries.get(symbol)
-                if pending is None or pending.entry_date != date:
-                    continue
-                if symbol in positions:
-                    continue
+                keys_for_symbol = [k for k in pending_entries if k[0] == symbol]
+                for key in keys_for_symbol:
+                    pending = pending_entries[key]
+                    if pending.entry_date != date:
+                        continue
+                    if key in positions:
+                        continue
 
-                entry_fill = self._estimate_entry_fill_from_row(row, direction=pending.direction)
-                # Direction-aware stop invalidation check
-                stop_invalid = (
-                    (pending.direction == 1 and entry_fill <= pending.initial_stop + cfg.eps)
-                    or (pending.direction == -1 and entry_fill >= pending.initial_stop - cfg.eps)
-                )
-                if stop_invalid:
-                    cancelled_entries.append(
-                        self._build_cancelled_entry(
-                            pending=pending,
-                            row=row,
-                            attempted_entry_fill=entry_fill,
-                            cancel_reason="OPEN_INVALIDATES_STOP",
-                        )
+                    entry_fill = self._estimate_entry_fill_from_row(row, direction=pending.direction)
+                    # Direction-aware stop invalidation check
+                    stop_invalid = (
+                        (pending.direction == 1 and entry_fill <= pending.initial_stop + cfg.eps)
+                        or (pending.direction == -1 and entry_fill >= pending.initial_stop - cfg.eps)
                     )
-                    del pending_entries[symbol]
-                    continue
-
-                # Risk blowout check: enforce hard cap on actual vs estimated risk.
-                contract_multiplier = float(row[cfg.multiplier_col])
-                actual_initial_risk = abs(entry_fill - pending.initial_stop)
-                actual_order_risk = actual_initial_risk * contract_multiplier * pending.qty
-                blowout_ratio = (
-                    actual_order_risk / pending.estimated_order_risk
-                    if pending.estimated_order_risk > cfg.eps
-                    else float("inf")
-                )
-
-                qty_override: Optional[int] = None
-                original_qty_record: Optional[int] = None
-                shrink_reason: Optional[str] = None
-
-                if blowout_ratio > cfg.risk_blowout_cap:
-                    if cfg.risk_blowout_action == "CANCEL":
+                    if stop_invalid:
                         cancelled_entries.append(
                             self._build_cancelled_entry(
                                 pending=pending,
                                 row=row,
                                 attempted_entry_fill=entry_fill,
-                                cancel_reason="RISK_BLOWOUT_CANCEL",
+                                cancel_reason="OPEN_INVALIDATES_STOP",
                             )
                         )
-                        del pending_entries[symbol]
+                        del pending_entries[key]
                         continue
-                    else:
-                        # SHRINK: reduce qty to bring risk within cap.
-                        per_contract_actual_risk = actual_initial_risk * contract_multiplier
-                        max_allowed_risk = cfg.risk_blowout_cap * pending.estimated_order_risk
-                        shrunk_qty = math.floor(max_allowed_risk / per_contract_actual_risk) if per_contract_actual_risk > cfg.eps else 0
-                        if shrunk_qty < 1:
+
+                    # Risk blowout check: enforce hard cap on actual vs estimated risk.
+                    contract_multiplier = float(row[cfg.multiplier_col])
+                    actual_initial_risk = abs(entry_fill - pending.initial_stop)
+                    actual_order_risk = actual_initial_risk * contract_multiplier * pending.qty
+                    blowout_ratio = (
+                        actual_order_risk / pending.estimated_order_risk
+                        if pending.estimated_order_risk > cfg.eps
+                        else float("inf")
+                    )
+
+                    qty_override: Optional[int] = None
+                    original_qty_record: Optional[int] = None
+                    shrink_reason: Optional[str] = None
+
+                    if blowout_ratio > cfg.risk_blowout_cap:
+                        if cfg.risk_blowout_action == "CANCEL":
                             cancelled_entries.append(
                                 self._build_cancelled_entry(
                                     pending=pending,
                                     row=row,
                                     attempted_entry_fill=entry_fill,
-                                    cancel_reason="RISK_BLOWOUT_SHRINK_TO_ZERO",
+                                    cancel_reason="RISK_BLOWOUT_CANCEL",
                                 )
                             )
-                            del pending_entries[symbol]
+                            del pending_entries[key]
                             continue
-                        original_qty_record = pending.qty
-                        qty_override = shrunk_qty
-                        shrink_reason = "RISK_BLOWOUT"
+                        else:
+                            # SHRINK: reduce qty to bring risk within cap.
+                            per_contract_actual_risk = actual_initial_risk * contract_multiplier
+                            max_allowed_risk = cfg.risk_blowout_cap * pending.estimated_order_risk
+                            shrunk_qty = math.floor(max_allowed_risk / per_contract_actual_risk) if per_contract_actual_risk > cfg.eps else 0
+                            if shrunk_qty < 1:
+                                cancelled_entries.append(
+                                    self._build_cancelled_entry(
+                                        pending=pending,
+                                        row=row,
+                                        attempted_entry_fill=entry_fill,
+                                        cancel_reason="RISK_BLOWOUT_SHRINK_TO_ZERO",
+                                    )
+                                )
+                                del pending_entries[key]
+                                continue
+                            original_qty_record = pending.qty
+                            qty_override = shrunk_qty
+                            shrink_reason = "RISK_BLOWOUT"
 
-                position, cash_entry_delta = self._fill_pending_entry(
-                    pending=pending,
-                    row=row,
-                    entry_fill=entry_fill,
-                    qty_override=qty_override,
-                    original_qty=original_qty_record,
-                    qty_shrink_reason=shrink_reason,
-                )
-                cash += cash_entry_delta
-                positions[symbol] = position
-                del pending_entries[symbol]
+                    position, cash_entry_delta = self._fill_pending_entry(
+                        pending=pending,
+                        row=row,
+                        entry_fill=entry_fill,
+                        qty_override=qty_override,
+                        original_qty=original_qty_record,
+                        qty_shrink_reason=shrink_reason,
+                    )
+                    cash += cash_entry_delta
+                    positions[key] = position
+                    del pending_entries[key]
 
-                immediate_exit_record = self._process_open_and_intraday_for_existing_position(
-                    position=position,
-                    row=row,
-                )
-                if immediate_exit_record is not None:
-                    cash += float(immediate_exit_record.pop("cash_delta"))
-                    closed_trades.append(immediate_exit_record)
-                    del positions[symbol]
+                    immediate_exit_record = self._process_open_and_intraday_for_existing_position(
+                        position=position,
+                        row=row,
+                    )
+                    if immediate_exit_record is not None:
+                        cash += float(immediate_exit_record.pop("cash_delta"))
+                        closed_trades.append(immediate_exit_record)
+                        del positions[key]
 
             # 3) Close-phase logic for surviving positions.
             for _, row in day_df.iterrows():
                 symbol = str(row[cfg.symbol_col])
-                if symbol not in positions:
-                    continue
-                self._process_close_phase(position=positions[symbol], row=row)
+                keys_for_symbol = [k for k in positions if k[0] == symbol]
+                for key in keys_for_symbol:
+                    position = positions[key]
+                    slot = self._strategy_map[position.strategy_id]
+                    slot.exit_strategy.process_close_phase(
+                        position=position, row=row, next_trade_date=row["next_trade_date"],
+                    )
 
             # 4) Update last available close per symbol.
             for _, row in day_df.iterrows():
@@ -428,104 +481,127 @@ class StrategyEngine:
                 last_close_by_symbol=last_close_by_symbol,
             )
 
+            # Drawdown circuit breaker with hysteresis (halt/resume)
+            equity_peak = max(equity_peak, equity_close)
+            current_drawdown = (equity_close / equity_peak - 1.0) if equity_peak > cfg.eps else 0.0
+            if not in_drawdown_halt and current_drawdown < -cfg.max_drawdown_halt:
+                in_drawdown_halt = True
+            elif in_drawdown_halt and current_drawdown > -cfg.drawdown_resume:
+                in_drawdown_halt = False
+            drawdown_halt = in_drawdown_halt
+
             # 6) Signal generation / next-open pending entries.
-            for _, row in day_df.iterrows():
-                risk_reject[(date, str(row[cfg.symbol_col]))] = None
+            # Initialize risk_reject for all strategies x symbols
+            for slot in self._strategies:
+                slot_day = rows_by_date_by_strategy[slot.strategy_id].get(date)
+                if slot_day is not None:
+                    for _, row in slot_day.iterrows():
+                        risk_reject[(date, str(row[cfg.symbol_col]), slot.strategy_id)] = None
 
             accepted_today_risk_total = 0.0
             accepted_notional_today = 0.0
             base_notional = self._compute_total_notional(
                 positions, pending_entries, close_map, last_close_by_symbol,
             )
-            candidate_rows = [
-                row
-                for _, row in day_df.iterrows()
-                if bool(row["entry_trigger_pass"])
-            ]
-            candidate_rows.sort(
-                key=lambda row: (
-                    pd.Timestamp.max
-                    if pd.isna(row["next_trade_date"])
-                    else pd.Timestamp(row["next_trade_date"]),
-                    str(row[cfg.symbol_col]),
+
+            for slot in self._strategies:
+                slot_day = rows_by_date_by_strategy[slot.strategy_id].get(date)
+                if slot_day is None:
+                    continue
+
+                candidate_rows = [
+                    row
+                    for _, row in slot_day.iterrows()
+                    if bool(row["entry_trigger_pass"])
+                ]
+                candidate_rows.sort(
+                    key=lambda row: (
+                        pd.Timestamp.max
+                        if pd.isna(row["next_trade_date"])
+                        else pd.Timestamp(row["next_trade_date"]),
+                        str(row[cfg.symbol_col]),
+                    )
                 )
-            )
 
-            for row in candidate_rows:
-                symbol = str(row[cfg.symbol_col])
-                group_name = str(row[cfg.group_col])
-                direction = int(row["entry_direction"])
-                reason: Optional[str] = None
+                for row in candidate_rows:
+                    symbol = str(row[cfg.symbol_col])
+                    key: PositionKey = (symbol, slot.strategy_id)
+                    group_name = str(row[cfg.group_col])
+                    direction = int(row["entry_direction"])
+                    reason: Optional[str] = None
 
-                if pd.isna(row["next_trade_date"]):
-                    reason = "NO_NEXT_TRADE_DATE"
-                elif symbol in positions:
-                    reason = "ALREADY_IN_POSITION"
-                elif symbol in pending_entries:
-                    reason = "PENDING_ENTRY_EXISTS"
-                else:
-                    entry_estimate = float(row[cfg.close_col])
-                    initial_stop = float(row["initial_stop"])
-                    contract_multiplier = float(row[cfg.multiplier_col])
-                    estimated_initial_risk = abs(entry_estimate - initial_stop)
-                    per_contract_risk_est = estimated_initial_risk * contract_multiplier
-
-                    if not np.isfinite(per_contract_risk_est) or per_contract_risk_est <= 0.0:
-                        reason = "NON_POSITIVE_RISK"
+                    if drawdown_halt:
+                        reason = "DRAWDOWN_HALT"
+                    elif pd.isna(row["next_trade_date"]):
+                        reason = "NO_NEXT_TRADE_DATE"
+                    elif key in positions:
+                        reason = "ALREADY_IN_POSITION"
+                    elif key in pending_entries:
+                        reason = "PENDING_ENTRY_EXISTS"
                     else:
-                        risk_budget_single = equity_close * cfg.risk_per_trade
-                        qty = math.floor(risk_budget_single / per_contract_risk_est)
-                        if qty < 1:
-                            reason = "QTY_LT_1"
+                        entry_estimate = float(row[cfg.close_col])
+                        initial_stop = float(row["initial_stop"])
+                        contract_multiplier = float(row[cfg.multiplier_col])
+                        estimated_initial_risk = abs(entry_estimate - initial_stop)
+                        per_contract_risk_est = estimated_initial_risk * contract_multiplier
+
+                        if not np.isfinite(per_contract_risk_est) or per_contract_risk_est <= 0.0:
+                            reason = "NON_POSITIVE_RISK"
                         else:
-                            order_risk = per_contract_risk_est * qty
-                            entry_date = pd.Timestamp(row["next_trade_date"])
-                            effective_open_risk, effective_open_risk_by_group = (
-                                self._compute_effective_open_risk_for_entry_date(
-                                    candidate_entry_date=entry_date,
-                                    positions=positions,
-                                    pending_entries=pending_entries,
-                                    close_map=close_map,
-                                    last_close_by_symbol=last_close_by_symbol,
-                                )
-                            )
-                            portfolio_cap = equity_close * cfg.portfolio_risk_cap
-                            group_cap = equity_close * cfg.group_risk_cap
-                            portfolio_risk_if_filled = effective_open_risk + order_risk
-                            group_risk_if_filled = effective_open_risk_by_group.get(group_name, 0.0) + order_risk
-
-                            # Leverage check (base_notional hoisted before loop)
-                            new_notional = entry_estimate * contract_multiplier * qty
-                            total_notional_if_filled = base_notional + accepted_notional_today + new_notional
-
-                            if portfolio_risk_if_filled > portfolio_cap + cfg.eps:
-                                reason = "PORTFOLIO_RISK_CAP"
-                            elif group_risk_if_filled > group_cap + cfg.eps:
-                                reason = "GROUP_RISK_CAP"
-                            elif equity_close > cfg.eps and total_notional_if_filled / equity_close > cfg.max_portfolio_leverage:
-                                reason = "LEVERAGE_CAP"
+                            risk_budget_single = equity_close * cfg.risk_per_trade
+                            qty = math.floor(risk_budget_single / per_contract_risk_est)
+                            if qty < 1:
+                                reason = "QTY_LT_1"
                             else:
-                                pending_entries[symbol] = PendingEntry(
-                                    symbol=symbol,
-                                    group_name=group_name,
-                                    direction=direction,
-                                    signal_date=date,
-                                    entry_date=entry_date,
-                                    entry_estimate=entry_estimate,
-                                    qty=qty,
-                                    atr_ref=float(row["atr_ref"]),
-                                    volume=float(row[cfg.volume_col]),
-                                    open_interest=float(row[cfg.open_interest_col]),
-                                    initial_stop=initial_stop,
-                                    estimated_initial_risk=estimated_initial_risk,
-                                    estimated_order_risk=order_risk,
-                                    contract_multiplier_est=contract_multiplier,
-                                    metadata=self._entry_strategy.build_pending_entry_metadata(row),
+                                order_risk = per_contract_risk_est * qty
+                                entry_date = pd.Timestamp(row["next_trade_date"])
+                                effective_open_risk, effective_open_risk_by_group = (
+                                    self._compute_effective_open_risk_for_entry_date(
+                                        candidate_entry_date=entry_date,
+                                        positions=positions,
+                                        pending_entries=pending_entries,
+                                        close_map=close_map,
+                                        last_close_by_symbol=last_close_by_symbol,
+                                    )
                                 )
-                                accepted_today_risk_total += order_risk
-                                accepted_notional_today += new_notional
+                                portfolio_cap = equity_close * cfg.portfolio_risk_cap
+                                group_cap = equity_close * cfg.group_risk_cap
+                                portfolio_risk_if_filled = effective_open_risk + order_risk
+                                group_risk_if_filled = effective_open_risk_by_group.get(group_name, 0.0) + order_risk
 
-                risk_reject[(date, symbol)] = reason
+                                # Leverage check (base_notional hoisted before loop)
+                                new_notional = entry_estimate * contract_multiplier * qty
+                                total_notional_if_filled = base_notional + accepted_notional_today + new_notional
+
+                                if portfolio_risk_if_filled > portfolio_cap + cfg.eps:
+                                    reason = "PORTFOLIO_RISK_CAP"
+                                elif group_risk_if_filled > group_cap + cfg.eps:
+                                    reason = "GROUP_RISK_CAP"
+                                elif equity_close > cfg.eps and total_notional_if_filled / equity_close > cfg.max_portfolio_leverage:
+                                    reason = "LEVERAGE_CAP"
+                                else:
+                                    pending_entries[key] = PendingEntry(
+                                        symbol=symbol,
+                                        strategy_id=slot.strategy_id,
+                                        group_name=group_name,
+                                        direction=direction,
+                                        signal_date=date,
+                                        entry_date=entry_date,
+                                        entry_estimate=entry_estimate,
+                                        qty=qty,
+                                        atr_ref=float(row["atr_ref"]),
+                                        volume=float(row[cfg.volume_col]),
+                                        open_interest=float(row[cfg.open_interest_col]),
+                                        initial_stop=initial_stop,
+                                        estimated_initial_risk=estimated_initial_risk,
+                                        estimated_order_risk=order_risk,
+                                        contract_multiplier_est=contract_multiplier,
+                                        metadata=slot.entry_strategy.build_pending_entry_metadata(row),
+                                    )
+                                    accepted_today_risk_total += order_risk
+                                    accepted_notional_today += new_notional
+
+                    risk_reject[(date, symbol, slot.strategy_id)] = reason
 
             total_notional = base_notional + accepted_notional_today
             leverage = total_notional / equity_close if equity_close > cfg.eps else 0.0
@@ -542,6 +618,8 @@ class StrategyEngine:
                     "accepted_signal_risk_today": accepted_today_risk_total,
                     "total_notional": total_notional,
                     "leverage": leverage,
+                    "drawdown_pct": current_drawdown,
+                    "drawdown_halt": drawdown_halt,
                 }
             )
 
@@ -551,6 +629,7 @@ class StrategyEngine:
                 ["exit_date", "symbol", "entry_date"]
             ).reset_index(drop=True)
 
+        # Daily status uses the first strategy's prepared data (backward compat)
         daily_status = prepared.copy()
         risk_reject_df = pd.DataFrame(
             [
@@ -560,6 +639,7 @@ class StrategyEngine:
                     "risk_reject_reason": value,
                 }
                 for key, value in risk_reject.items()
+                if key[2] == first_strategy_id  # only first strategy for daily_status
             ]
         )
         if risk_reject_df.empty:
@@ -656,21 +736,117 @@ class StrategyEngine:
         if (open_interest < 0).any():
             raise ValueError("open_interest must be >= 0.")
 
-    def _prepare_symbol_frame(self, df: pd.DataFrame) -> pd.DataFrame:
+    def _prepare_symbol_base(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Compute engine-universal columns (ATR, atr_ref, next_trade_date)."""
         cfg = self.config
         high = df[cfg.high_col].astype(float)
         low = df[cfg.low_col].astype(float)
         close = df[cfg.close_col].astype(float)
 
-        # Engine base: ATR + atr_ref + next_trade_date (universal)
         out = df.copy()
         out["atr"] = _wilder_atr(high=high, low=low, close=close, period=cfg.atr_period)
         out["atr_ref"] = out["atr"].shift(1)
         out["next_trade_date"] = out[cfg.date_col].shift(-1)
-
-        # Delegate signal computation to entry strategy
-        out = self._entry_strategy.prepare_signals(out)
         return out
+
+    def _prepare_symbol_frame(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Backward-compat: base + first strategy's signals."""
+        base = self._prepare_symbol_base(df)
+        return self._strategies[0].entry_strategy.prepare_signals(base)
+
+    def _prepare_all_strategies(self, bars: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+        """Prepare data for every strategy slot.
+
+        Returns a dict keyed by strategy_id. Each value is a fully-prepared
+        DataFrame (base columns + that strategy's signal columns).
+        """
+        cfg = self.config
+        self._validate_input_columns(bars)
+
+        df = bars.copy()
+        dt = pd.to_datetime(df[cfg.date_col], errors="raise")
+        if hasattr(dt.dt, "tz") and dt.dt.tz is not None:
+            dt = dt.dt.tz_convert("Asia/Shanghai").dt.tz_localize(None)
+        df[cfg.date_col] = dt.dt.normalize()
+        df = df.sort_values([cfg.symbol_col, cfg.date_col]).reset_index(drop=True)
+
+        duplicate_mask = df.duplicated(subset=[cfg.symbol_col, cfg.date_col], keep=False)
+        if duplicate_mask.any():
+            dupes = df.loc[duplicate_mask, [cfg.symbol_col, cfg.date_col]]
+            raise ValueError(f"Duplicate symbol/date rows after date normalization:\n{dupes}")
+
+        numeric_cols = [
+            cfg.open_col, cfg.high_col, cfg.low_col, cfg.close_col,
+            cfg.volume_col, cfg.open_interest_col, cfg.multiplier_col,
+            cfg.commission_col, cfg.slippage_col,
+        ]
+        for col in numeric_cols:
+            df[col] = pd.to_numeric(df[col], errors="raise")
+
+        for col in [cfg.multiplier_col, cfg.group_col]:
+            df[col] = df.groupby(cfg.symbol_col, sort=False)[col].ffill()
+            if df[col].isna().any():
+                raise ValueError(
+                    f"Leading missing values in '{col}'. "
+                    "Cannot backfill from future rows."
+                )
+
+        for col in [cfg.commission_col, cfg.slippage_col]:
+            if df[col].isna().any():
+                raise ValueError(
+                    f"Column '{col}' contains missing values. "
+                    "Provide an explicit cost schedule."
+                )
+
+        if cfg.margin_rate_col not in df.columns:
+            df[cfg.margin_rate_col] = cfg.default_margin_rate
+
+        self._validate_input_values(df)
+
+        self._gap_diagnostics = []
+        for symbol, sym_df in df.groupby(cfg.symbol_col, sort=False):
+            gap_days = sym_df[cfg.date_col].diff().dt.days
+            suspicious = gap_days > 10
+            if suspicious.any():
+                for idx in sym_df.index[suspicious]:
+                    self._gap_diagnostics.append({
+                        "symbol": symbol,
+                        "date": sym_df.loc[idx, cfg.date_col],
+                        "gap_days": int(gap_days.loc[idx]),
+                    })
+
+        # Build base frames per symbol (ATR, atr_ref, next_trade_date)
+        base_frames: List[pd.DataFrame] = []
+        for _, symbol_df in df.groupby(cfg.symbol_col, sort=False):
+            base_frames.append(self._prepare_symbol_base(symbol_df.reset_index(drop=True)))
+
+        if not base_frames:
+            # Empty input
+            result: Dict[str, pd.DataFrame] = {}
+            for slot in self._strategies:
+                empty = df.copy()
+                for col in self._prepared_extra_columns():
+                    empty[col] = pd.Series(dtype="float64")
+                result[slot.strategy_id] = empty
+            return result
+
+        base_all = pd.concat(base_frames, axis=0, ignore_index=True)
+        base_all = base_all.sort_values([cfg.date_col, cfg.symbol_col]).reset_index(drop=True)
+
+        # For each strategy slot, apply its entry_strategy.prepare_signals
+        # on per-symbol copies of the base frame
+        result = {}
+        for slot in self._strategies:
+            slot_frames: List[pd.DataFrame] = []
+            for _, symbol_df in base_all.groupby(cfg.symbol_col, sort=False):
+                slot_frames.append(
+                    slot.entry_strategy.prepare_signals(symbol_df.reset_index(drop=True))
+                )
+            slot_prepared = pd.concat(slot_frames, axis=0, ignore_index=True)
+            slot_prepared = slot_prepared.sort_values([cfg.date_col, cfg.symbol_col]).reset_index(drop=True)
+            result[slot.strategy_id] = slot_prepared
+
+        return result
 
     def _estimate_entry_fill_from_row(self, row: pd.Series, direction: int = 1) -> float:
         cfg = self.config
@@ -709,6 +885,7 @@ class StrategyEngine:
 
         position = Position(
             symbol=pending.symbol,
+            strategy_id=pending.strategy_id,
             group_name=pending.group_name,
             direction=pending.direction,
             signal_date=pending.signal_date,
@@ -771,6 +948,7 @@ class StrategyEngine:
         )
         record: Dict[str, Any] = {
             "symbol": pending.symbol,
+            "strategy_id": pending.strategy_id,
             "group_name": pending.group_name,
             "signal_date": pending.signal_date,
             "entry_date": pending.entry_date,
@@ -873,6 +1051,7 @@ class StrategyEngine:
 
         record: Dict[str, Any] = {
             "symbol": position.symbol,
+            "strategy_id": position.strategy_id,
             "group_name": position.group_name,
             "direction": position.direction,
             "signal_date": position.signal_date,
@@ -919,25 +1098,27 @@ class StrategyEngine:
     def _compute_equity_close(
         self,
         cash: float,
-        positions: Dict[str, Position],
+        positions: Dict[Tuple[str, str], Position],
         close_map: Dict[str, float],
         last_close_by_symbol: Dict[str, float],
     ) -> float:
         unrealized = 0.0
-        for symbol, position in positions.items():
+        for position in positions.values():
+            symbol = position.symbol
             mark_price = close_map.get(symbol, last_close_by_symbol.get(symbol, position.entry_fill))
             unrealized += self._directional_pnl(mark_price, position.entry_fill, position.direction) * position.contract_multiplier * position.qty
         return cash + unrealized
 
     def _compute_open_risk(
         self,
-        positions: Dict[str, Position],
+        positions: Dict[Tuple[str, str], Position],
         close_map: Dict[str, float],
         last_close_by_symbol: Dict[str, float],
     ) -> Tuple[float, Dict[str, float]]:
         open_risk_total = 0.0
         by_group: Dict[str, float] = {}
-        for symbol, position in positions.items():
+        for position in positions.values():
+            symbol = position.symbol
             current_price = close_map.get(symbol, last_close_by_symbol.get(symbol, position.entry_fill))
             current_risk = max(self._directional_pnl(current_price, position.active_stop, position.direction), 0.0) * position.contract_multiplier * position.qty
             open_risk_total += current_risk
@@ -947,17 +1128,18 @@ class StrategyEngine:
     def _compute_effective_open_risk_for_entry_date(
         self,
         candidate_entry_date: pd.Timestamp,
-        positions: Dict[str, Position],
-        pending_entries: Dict[str, PendingEntry],
+        positions: Dict[Tuple[str, str], Position],
+        pending_entries: Dict[Tuple[str, str], PendingEntry],
         close_map: Dict[str, float],
         last_close_by_symbol: Dict[str, float],
     ) -> Tuple[float, Dict[str, float]]:
         total = 0.0
         by_group: Dict[str, float] = {}
 
-        for symbol, position in positions.items():
+        for position in positions.values():
             if position.pending_exit_date is not None and position.pending_exit_date <= candidate_entry_date:
                 continue
+            symbol = position.symbol
             current_price = close_map.get(symbol, last_close_by_symbol.get(symbol, position.entry_fill))
             current_risk = max(self._directional_pnl(current_price, position.active_stop, position.direction), 0.0) * position.contract_multiplier * position.qty
             total += current_risk
@@ -974,24 +1156,26 @@ class StrategyEngine:
 
     def _compute_total_notional(
         self,
-        positions: Dict[str, Position],
-        pending_entries: Dict[str, PendingEntry],
+        positions: Dict[Tuple[str, str], Position],
+        pending_entries: Dict[Tuple[str, str], PendingEntry],
         close_map: Dict[str, float],
         last_close_by_symbol: Dict[str, float],
     ) -> float:
         total = 0.0
-        for symbol, position in positions.items():
+        for position in positions.values():
+            symbol = position.symbol
             mark_price = close_map.get(symbol, last_close_by_symbol.get(symbol, position.entry_fill))
             total += mark_price * position.contract_multiplier * position.qty
         for pending in pending_entries.values():
             total += pending.entry_estimate * pending.contract_multiplier_est * pending.qty
         return total
 
-    def _serialize_open_positions(self, positions: Dict[str, Position]) -> pd.DataFrame:
+    def _serialize_open_positions(self, positions: Dict[Tuple[str, str], Position]) -> pd.DataFrame:
         rows: List[Dict[str, Any]] = []
         for position in positions.values():
             row_dict: Dict[str, Any] = {
                 "symbol": position.symbol,
+                "strategy_id": position.strategy_id,
                 "group_name": position.group_name,
                 "direction": position.direction,
                 "signal_date": position.signal_date,
@@ -1068,6 +1252,7 @@ class StrategyEngine:
         return pd.DataFrame(
             columns=[
                 "symbol",
+                "strategy_id",
                 "group_name",
                 "direction",
                 "signal_date",
@@ -1113,6 +1298,7 @@ class StrategyEngine:
         return pd.DataFrame(
             columns=[
                 "symbol",
+                "strategy_id",
                 "group_name",
                 "direction",
                 "signal_date",
@@ -1152,6 +1338,7 @@ class StrategyEngine:
         return pd.DataFrame(
             columns=[
                 "symbol",
+                "strategy_id",
                 "group_name",
                 "signal_date",
                 "entry_date",
