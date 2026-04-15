@@ -70,6 +70,9 @@ def build_engine_config(cfg: Dict[str, Any]) -> EngineConfig:
         risk_blowout_action=e.get("risk_blowout_action", "SHRINK"),
         allow_short=bool(e.get("allow_short", False)),
         stop_atr_mult=float(e.get("stop_atr_mult", 2.0)),
+        adx_period=int(e.get("adx_period", 20)),
+        adx_scale=float(e.get("adx_scale", 30.0)),
+        adx_floor=float(e.get("adx_floor", 0.2)),
     )
 
 

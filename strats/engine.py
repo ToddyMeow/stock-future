@@ -24,6 +24,7 @@ from strats.helpers import (
     directional_pnl,
     favorable_excursion,
     adverse_excursion,
+    adx as _adx,
     wilder_atr as _wilder_atr,
     rolling_last_value_percentile as _rolling_last_value_percentile,
 )
@@ -65,6 +66,9 @@ class EngineConfig:
 
     # Shared technical
     atr_period: int = 20
+    adx_period: int = 20
+    adx_scale: float = 30.0      # ADX / adx_scale = trend_score (before clip)
+    adx_floor: float = 0.2       # minimum trend_score (never fully zero out)
 
     # R definition: R = stop_atr_mult × ATR(atr_period)
     # initial_stop = entry_price ∓ stop_atr_mult × atr_ref
@@ -549,7 +553,11 @@ class StrategyEngine:
                         if not np.isfinite(per_contract_risk_est) or per_contract_risk_est <= 0.0:
                             reason = "NON_POSITIVE_RISK"
                         else:
-                            risk_budget_single = equity_close * cfg.risk_per_trade
+                            # ADX trend filter: scale risk by group trend strength
+                            adx_val = float(row["adx"]) if pd.notna(row.get("adx")) else cfg.adx_scale
+                            trend_score = max(min(adx_val / cfg.adx_scale, 1.0), cfg.adx_floor)
+                            effective_risk = cfg.risk_per_trade * trend_score
+                            risk_budget_single = equity_close * effective_risk
                             qty = math.floor(risk_budget_single / per_contract_risk_est)
                             if qty < 1:
                                 reason = "QTY_LT_1"
@@ -745,7 +753,7 @@ class StrategyEngine:
             raise ValueError("open_interest must be >= 0.")
 
     def _prepare_symbol_base(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Compute engine-universal columns (ATR, atr_ref, next_trade_date)."""
+        """Compute engine-universal columns (ATR, atr_ref, ADX, next_trade_date)."""
         cfg = self.config
         high = df[cfg.high_col].astype(float)
         low = df[cfg.low_col].astype(float)
@@ -754,6 +762,7 @@ class StrategyEngine:
         out = df.copy()
         out["atr"] = _wilder_atr(high=high, low=low, close=close, period=cfg.atr_period)
         out["atr_ref"] = out["atr"].shift(1)
+        out["adx"] = _adx(high=high, low=low, close=close, period=cfg.adx_period)
         out["next_trade_date"] = out[cfg.date_col].shift(-1)
         return out
 

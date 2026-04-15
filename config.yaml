@@ -15,6 +15,12 @@ engine:
   # R = stop_atr_mult × ATR(atr_period)
   stop_atr_mult: 2.0
 
+  # ADX 趋势滤波：trend_score = clip(ADX / adx_scale, adx_floor, 1.0)
+  # effective_risk = risk_per_trade × trend_score
+  adx_period: 20
+  adx_scale: 30.0     # ADX=30 → trend_score=1.0 (满仓位)
+  adx_floor: 0.2      # ADX 很低时最少保留 20% 仓位
+
   # 风控
   risk_per_trade: 0.02
   portfolio_risk_cap: 0.15

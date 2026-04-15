@@ -39,36 +39,66 @@ def adverse_excursion(extreme_price: float, entry_price: float, direction: int) 
 # ── Technical indicators ──────────────────────────────────────────────────
 
 
+def wilder_smooth(values: np.ndarray, period: int) -> np.ndarray:
+    """Wilder's recursive smoothing (used by ATR and ADX). NaN-safe."""
+    out = np.full(len(values), np.nan, dtype=float)
+    if len(values) < period:
+        return out
+    out[period - 1] = np.nanmean(values[:period])
+    for i in range(period, len(values)):
+        prev = out[i - 1]
+        cur = values[i]
+        if np.isnan(cur):
+            out[i] = prev
+        elif np.isnan(prev):
+            out[i] = cur
+        else:
+            out[i] = ((prev * (period - 1)) + cur) / period
+    return out
+
+
+def adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 20) -> pd.Series:
+    """Average Directional Index (ADX). Returns values 0-100."""
+    h = high.to_numpy(dtype=float)
+    l = low.to_numpy(dtype=float)
+    c = close.to_numpy(dtype=float)
+    n = len(h)
+
+    # True Range
+    prev_c = np.full(n, np.nan); prev_c[1:] = c[:-1]
+    tr = np.maximum(np.maximum(np.abs(h - l), np.abs(h - prev_c)), np.abs(l - prev_c))
+
+    # Directional Movement
+    up_move = np.zeros(n); down_move = np.zeros(n)
+    up_move[1:] = h[1:] - h[:-1]
+    down_move[1:] = l[:-1] - l[1:]
+
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+
+    # Wilder smooth all three
+    atr_smooth = wilder_smooth(tr, period)
+    plus_dm_smooth = wilder_smooth(plus_dm, period)
+    minus_dm_smooth = wilder_smooth(minus_dm, period)
+
+    # +DI, -DI
+    with np.errstate(divide='ignore', invalid='ignore'):
+        plus_di = 100.0 * plus_dm_smooth / np.where(atr_smooth > 0, atr_smooth, np.nan)
+        minus_di = 100.0 * minus_dm_smooth / np.where(atr_smooth > 0, atr_smooth, np.nan)
+        dx = 100.0 * np.abs(plus_di - minus_di) / np.where((plus_di + minus_di) > 0, plus_di + minus_di, np.nan)
+
+    # ADX = Wilder smooth of DX
+    adx_values = wilder_smooth(dx, period)
+    return pd.Series(adx_values, index=high.index)
+
+
 def wilder_atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int) -> pd.Series:
     prev_close = close.shift(1)
     tr = pd.concat(
-        [
-            (high - low).abs(),
-            (high - prev_close).abs(),
-            (low - prev_close).abs(),
-        ],
+        [(high - low).abs(), (high - prev_close).abs(), (low - prev_close).abs()],
         axis=1,
     ).max(axis=1)
-
-    out = pd.Series(np.nan, index=tr.index, dtype=float)
-    if len(tr) < period:
-        return out
-
-    tr_values = tr.to_numpy(dtype=float)
-    atr_values = np.full(len(tr_values), np.nan, dtype=float)
-    atr_values[period - 1] = np.nanmean(tr_values[:period])
-    for i in range(period, len(tr_values)):
-        prev = atr_values[i - 1]
-        cur_tr = tr_values[i]
-        if np.isnan(cur_tr):
-            # Skip NaN TR: carry forward previous ATR instead of poisoning
-            atr_values[i] = prev
-        elif np.isnan(prev):
-            # Previous ATR was NaN (shouldn't happen after init, but guard)
-            atr_values[i] = cur_tr
-        else:
-            atr_values[i] = ((prev * (period - 1)) + cur_tr) / period
-    return pd.Series(atr_values, index=tr.index)
+    return pd.Series(wilder_smooth(tr.to_numpy(dtype=float), period), index=tr.index)
 
 
 def rolling_last_value_percentile(values: pd.Series, window: int) -> pd.Series:
