@@ -252,7 +252,7 @@ class StrategyEngine:
         if prepared.empty:
             return BacktestResult(
                 trades=self._empty_trades_frame(),
-                daily_status=pd.DataFrame(columns=self._daily_status_columns()),
+                daily_status=pd.DataFrame(),
                 portfolio_daily=pd.DataFrame(
                     columns=[
                         "date",
@@ -571,7 +571,7 @@ class StrategyEngine:
                 on=[cfg.date_col, cfg.symbol_col],
             )
 
-        daily_status = daily_status[self._daily_status_columns()].sort_values(
+        daily_status = daily_status[self._daily_status_columns(daily_status)].sort_values(
             [cfg.date_col, cfg.symbol_col]
         ).reset_index(drop=True)
 
@@ -1031,69 +1031,38 @@ class StrategyEngine:
             return self._empty_open_positions_frame()
         return pd.DataFrame(rows).sort_values(["symbol", "entry_date"]).reset_index(drop=True)
 
-    def _prepared_extra_columns(self) -> List[str]:
-        return [
-            "atr",
-            "bb_mid",
-            "bb_upper",
-            "bb_lower",
-            "bandwidth_denom",
-            "bandwidth",
-            "bb_percentile",
-            "atr_ref",
-            "box_high",
-            "box_low",
-            "box_width",
-            "tol",
-            "box_width_pass",
-            "is_box",
-            "has_upper_test_1",
-            "has_lower_confirm",
-            "has_upper_test_2",
-            "has_lower_test_1",
-            "has_upper_confirm",
-            "has_lower_test_2",
-            "shadow_ratio",
-            "bb_filter_pass",
-            "entry_trigger_pass",
-            "entry_direction",
-            "initial_stop",
-            "next_trade_date",
-        ]
+    # Engine-universal columns always present in prepared data
+    _ENGINE_BASE_COLUMNS = ["atr", "atr_ref", "next_trade_date"]
+    _ENGINE_SIGNAL_COLUMNS = ["entry_trigger_pass", "entry_direction", "initial_stop"]
 
-    def _daily_status_columns(self) -> List[str]:
+    def _prepared_extra_columns(self) -> List[str]:
+        """Minimum extra columns guaranteed by the engine (for empty frame)."""
+        return self._ENGINE_BASE_COLUMNS + self._ENGINE_SIGNAL_COLUMNS
+
+    def _daily_status_columns(self, prepared: pd.DataFrame) -> List[str]:
+        """Build daily_status column list dynamically from actual prepared data."""
         cfg = self.config
-        return [
-            cfg.date_col,
-            cfg.symbol_col,
-            cfg.group_col,
-            cfg.open_col,
-            cfg.high_col,
-            cfg.low_col,
-            cfg.close_col,
-            cfg.volume_col,
-            cfg.open_interest_col,
-            "atr",
-            "atr_ref",
-            "bandwidth",
-            "bb_percentile",
-            "box_high",
-            "box_low",
-            "box_width",
-            "tol",
-            "shadow_ratio",
-            "is_box",
-            "has_upper_test_1",
-            "has_lower_confirm",
-            "has_upper_test_2",
-            "has_lower_test_1",
-            "has_upper_confirm",
-            "has_lower_test_2",
-            "bb_filter_pass",
-            "entry_trigger_pass",
-            "entry_direction",
-            "risk_reject_reason",
+        # Universal engine columns first
+        base = [
+            cfg.date_col, cfg.symbol_col, cfg.group_col,
+            cfg.open_col, cfg.high_col, cfg.low_col, cfg.close_col,
+            cfg.volume_col, cfg.open_interest_col,
+            "atr", "atr_ref",
         ]
+        # Entry-strategy-specific columns (everything the strategy added beyond engine base)
+        skip = set(base) | {"next_trade_date", "initial_stop", "risk_reject_reason"}
+        skip |= {cfg.multiplier_col, cfg.commission_col, cfg.slippage_col, cfg.margin_rate_col}
+        extra = [c for c in prepared.columns if c not in skip]
+        # Always end with required signal columns
+        tail = ["entry_trigger_pass", "entry_direction", "risk_reject_reason"]
+        # Deduplicate while preserving order
+        seen = set()
+        result = []
+        for c in base + extra + tail:
+            if c not in seen and c in prepared.columns:
+                seen.add(c)
+                result.append(c)
+        return result
 
     def _empty_trades_frame(self) -> pd.DataFrame:
         return pd.DataFrame(
