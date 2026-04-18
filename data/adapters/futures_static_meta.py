@@ -1,15 +1,38 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, Optional
 
 
 @dataclass(frozen=True)
 class FuturesMeta:
-    commission: float
+    commission: float  # fallback yuan/lot when commission_type is by_volume (legacy)
     slippage: float
     group_name: str
     margin_rate: float = 0.10
+    # Commission spec (5.2). Fetched from RQData via scripts/fetch_commission_specs.py.
+    # `by_volume` → commission per lot = commission_rate (yuan)
+    # `by_money`  → commission per lot = commission_rate × price × multiplier
+    # Defaults preserve old behavior: treat `commission` field as by_volume yuan/lot.
+    commission_type: str = "by_volume"
+    commission_rate: Optional[float] = None  # None → fall back to `commission` field
+
+
+_COMMISSION_SPECS_PATH = Path(__file__).resolve().parent.parent.parent / "data" / "cache" / "commission_specs.json"
+
+
+def _load_commission_specs() -> Dict[str, Dict[str, object]]:
+    if not _COMMISSION_SPECS_PATH.exists():
+        return {}
+    try:
+        return json.loads(_COMMISSION_SPECS_PATH.read_text())
+    except Exception:
+        return {}
+
+
+_COMMISSION_SPECS = _load_commission_specs()
 
 
 DEFAULT_FUTURES_META = FuturesMeta(
@@ -134,10 +157,7 @@ def get_meta(
     """
     key = underlying_symbol.upper()
     override = FUTURES_META_OVERRIDES.get(key)
-    if override is not None:
-        return override
-
-    return FuturesMeta(
+    base = override or FuturesMeta(
         commission=DEFAULT_FUTURES_META.commission,
         slippage=DEFAULT_FUTURES_META.slippage,
         group_name=infer_group_name(
@@ -146,3 +166,16 @@ def get_meta(
             product=product,
         ),
     )
+    # Overlay commission spec from RQData fetch (5.2). Falls through silently
+    # when the JSON cache is missing — preserves legacy by_volume behavior.
+    spec = _COMMISSION_SPECS.get(key)
+    if spec is not None:
+        return FuturesMeta(
+            commission=base.commission,
+            slippage=base.slippage,
+            group_name=base.group_name,
+            margin_rate=base.margin_rate,
+            commission_type=str(spec.get("type", "by_volume")),
+            commission_rate=float(spec["rate"]) if "rate" in spec else None,
+        )
+    return base

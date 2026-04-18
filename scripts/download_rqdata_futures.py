@@ -33,6 +33,7 @@ from data.adapters.rqdata_futures_adatpter import (
     RQDataFuturesResearchAdapter,
     RQSymbolSpec,
 )
+from data.adapters.trading_calendar import TradingCalendar
 
 try:
     import rqdatac
@@ -42,7 +43,7 @@ except ImportError:  # pragma: no cover - exercised via runtime guard
     rqfutures = None
 
 
-DEFAULT_FIELDS = ["open", "high", "low", "close", "volume", "open_interest"]
+DEFAULT_FIELDS = ["open", "high", "low", "close", "settlement", "volume", "open_interest"]
 DEFAULT_FREQUENCY = "1d"
 DEFAULT_VARIANTS = ["none", "pre"]
 VALID_KINDS = {"contract", "dominant"}
@@ -828,9 +829,19 @@ def build_normalized_dataset(
     if not normalization_inputs:
         return ["skip normalized dataset: no jobs selected for normalization"]
 
+    try:
+        calendar = TradingCalendar.default()
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            "Trading calendar cache missing. Run scripts/build_trading_calendar.py "
+            "to generate data/cache/calendar/cn_futures_trading_days.csv before "
+            "building the normalized dataset."
+        ) from exc
+
     adapter = RQDataFuturesResearchAdapter(
         default_slippage_override=adapter_config.get("default_slippage_override"),
         drop_zero_volume_rows=bool(adapter_config.get("drop_zero_volume_rows", False)),
+        calendar=calendar,
     )
     normalized = adapter.normalize_many(
         rq_dfs=[item.rq_df for item in normalization_inputs],

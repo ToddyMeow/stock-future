@@ -7,6 +7,8 @@ from typing import List, Optional
 import pandas as pd
 
 from data.adapters.futures_static_meta import get_meta
+from data.adapters.ohlc_repair import repair_ohlc_envelope
+from data.adapters.trading_calendar import TradingCalendar
 
 
 @dataclass(frozen=True)
@@ -59,6 +61,7 @@ class RQDataFuturesResearchAdapter:
         "high",
         "low",
         "close",
+        "settle",
         "volume",
         "open_interest",
         "contract_multiplier",
@@ -72,9 +75,13 @@ class RQDataFuturesResearchAdapter:
         self,
         default_slippage_override: Optional[float] = None,
         drop_zero_volume_rows: bool = False,
+        calendar: Optional[TradingCalendar] = None,
+        repair_ohlc: bool = True,
     ) -> None:
         self.default_slippage_override = default_slippage_override
         self.drop_zero_volume_rows = drop_zero_volume_rows
+        self._calendar = calendar
+        self._repair_ohlc = repair_ohlc
 
     def normalize_one(
         self,
@@ -99,6 +106,30 @@ class RQDataFuturesResearchAdapter:
         self._validate_columns(df)
         multiplier_series = self._resolve_contract_multiplier(df, symbol_spec)
 
+        # settle is RQData's `settlement` column (official daily VWAP / settle price).
+        # Fall back to `close` if the field wasn't requested in the download —
+        # keeps backward compat with legacy CSVs that only pulled OHLCV.
+        if "settlement" in df.columns:
+            settle_series = pd.to_numeric(df["settlement"], errors="coerce")
+        elif "settle" in df.columns:
+            settle_series = pd.to_numeric(df["settle"], errors="coerce")
+        else:
+            settle_series = pd.to_numeric(df["close"], errors="coerce")
+
+        close_series = pd.to_numeric(df["close"], errors="coerce")
+        # Commission per-row (5.2). Legacy by_volume: constant yuan/lot.
+        # by_money: rate × |close| × multiplier. Using abs guards against
+        # Panama-adjusted close drifting negative on deep-offset symbols
+        # (I, P, LU, EC). Raw data from RQData is always positive so this
+        # is a no-op in normal download paths.
+        if meta.commission_type == "by_money" and meta.commission_rate is not None:
+            commission_series = meta.commission_rate * close_series.abs() * multiplier_series
+        else:
+            commission_series = pd.Series(
+                float(meta.commission_rate) if meta.commission_rate is not None else float(meta.commission),
+                index=df.index,
+            )
+
         out = pd.DataFrame(
             {
                 "date": pd.to_datetime(df["date"], errors="coerce").dt.normalize(),
@@ -106,11 +137,12 @@ class RQDataFuturesResearchAdapter:
                 "open": pd.to_numeric(df["open"], errors="coerce"),
                 "high": pd.to_numeric(df["high"], errors="coerce"),
                 "low": pd.to_numeric(df["low"], errors="coerce"),
-                "close": pd.to_numeric(df["close"], errors="coerce"),
+                "close": close_series,
+                "settle": settle_series,
                 "volume": pd.to_numeric(df["volume"], errors="coerce"),
                 "open_interest": pd.to_numeric(df["open_interest"], errors="coerce"),
                 "contract_multiplier": multiplier_series,
-                "commission": float(meta.commission),
+                "commission": commission_series,
                 "slippage": float(
                     self.default_slippage_override
                     if self.default_slippage_override is not None
@@ -127,6 +159,20 @@ class RQDataFuturesResearchAdapter:
 
         out = self._basic_clean(out)
         out = out[self.OUTPUT_COLUMNS]
+        if self._repair_ohlc:
+            # Envelope [low, high] around open/close/settle so every row
+            # satisfies OHLC sanity. Limit-lock + settle alignment would
+            # otherwise leave close/settle outside the traded range (method B
+            # from 1.4 HANDOFF). h<l stays broken if it was broken.
+            repair_ohlc_envelope(
+                out, high_col="high", low_col="low",
+                enveloped_cols=["open", "close", "settle"],
+            )
+        if self._calendar is not None:
+            self._calendar.validate_trading_days(
+                out["date"],
+                context=f"symbol={symbol_spec.strategy_symbol}",
+            )
         return out
 
     def normalize_many(

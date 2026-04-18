@@ -197,6 +197,96 @@ def detect_lhl_pattern(
     return valid, has_lower_test_1, has_upper_confirm, has_lower_test_2
 
 
+# ── Overfitting diagnostics (Bailey & López de Prado) ─────────────────────
+
+
+def deflated_sharpe(returns: pd.Series, n_trials: int) -> float:
+    """Bailey-López de Prado Deflated Sharpe Ratio (probability-scale).
+
+    Given `n_trials` strategy variants were evaluated and the best Sharpe was
+    picked, DSR is the probability that the selected strategy's TRUE Sharpe
+    is greater than zero AFTER adjusting for multiple testing and for the
+    non-normality of its returns. Values close to 1 = strong evidence of
+    edge; values near 0.5 = indistinguishable from luck.
+
+    Returns NaN when inputs are too degenerate to compute.
+    """
+    r = pd.Series(returns).dropna()
+    T = len(r)
+    if T < 30 or n_trials < 1 or r.std(ddof=1) == 0.0:
+        return float("nan")
+    sr = r.mean() / r.std(ddof=1)
+    skew = r.skew()
+    kurt = r.kurt() + 3.0  # pandas .kurt() is excess; add 3 for raw kurtosis
+    # Variance of SR accounting for non-normality (Mertens 2002 / Lo 2002).
+    var_sr = (1.0 - skew * sr + 0.25 * (kurt - 1.0) * (sr ** 2)) / (T - 1)
+    if var_sr <= 0:
+        return float("nan")
+    sd_sr = np.sqrt(var_sr)
+    # Expected max Sharpe under the null across n_trials independent draws
+    # (Bailey-López de Prado 2014, eq 12).
+    euler_mascheroni = 0.5772156649
+    N = max(int(n_trials), 2)
+    from scipy.stats import norm
+    exp_max_sr = sd_sr * (
+        (1.0 - euler_mascheroni) * norm.ppf(1.0 - 1.0 / N)
+        + euler_mascheroni * norm.ppf(1.0 - 1.0 / (N * np.e))
+    )
+    z = (sr - exp_max_sr) / sd_sr
+    return float(norm.cdf(z))
+
+
+def pbo_cscv(returns_matrix: pd.DataFrame, n_splits: int = 16) -> float:
+    """Probability of Backtest Overfitting via Combinatorially Symmetric
+    Cross-Validation (Bailey-Borwein-López-Zhu 2014).
+
+    `returns_matrix` is (T, N) — each column is one strategy variant's daily
+    returns. Splits T into `n_splits` equal chunks, iterates every way to
+    pick n_splits/2 chunks as IS; for each split picks the IS best strategy
+    and computes its OOS rank; PBO = P(OOS rank ≤ median). Values near 0
+    mean IS Sharpe generalizes well; 0.5 = pure luck; near 1 = severe
+    overfitting.
+
+    Returns NaN when the matrix is too small to split meaningfully.
+    """
+    import itertools
+    rm = pd.DataFrame(returns_matrix).dropna(how="all")
+    T, N = rm.shape
+    if T < n_splits * 2 or N < 2:
+        return float("nan")
+    if n_splits % 2 != 0:
+        raise ValueError("n_splits must be even")
+
+    # Partition rows into n_splits equal chunks (drop overflow).
+    chunk_size = T // n_splits
+    chunks = [rm.iloc[i * chunk_size:(i + 1) * chunk_size] for i in range(n_splits)]
+    half = n_splits // 2
+    indices = list(range(n_splits))
+    logits: list[float] = []
+    for is_idx in itertools.combinations(indices, half):
+        is_chunks = [chunks[i] for i in is_idx]
+        oos_chunks = [chunks[i] for i in indices if i not in is_idx]
+        is_df = pd.concat(is_chunks)
+        oos_df = pd.concat(oos_chunks)
+        # Sharpe per column (ignoring annualization — ratio not affected).
+        is_sr = is_df.mean() / is_df.std(ddof=1).replace(0.0, np.nan)
+        oos_sr = oos_df.mean() / oos_df.std(ddof=1).replace(0.0, np.nan)
+        if is_sr.isna().all() or oos_sr.isna().all():
+            continue
+        best = is_sr.idxmax()
+        oos_rank = oos_sr.rank(ascending=True).get(best, np.nan)
+        if pd.isna(oos_rank):
+            continue
+        relative = float(oos_rank) / (N + 1)  # in (0, 1)
+        if relative <= 0 or relative >= 1:
+            continue
+        logits.append(np.log(relative / (1.0 - relative)))
+    if not logits:
+        return float("nan")
+    arr = np.array(logits, dtype=float)
+    return float((arr < 0.0).mean())
+
+
 # ── Portfolio analytics ───────────────────────────────────────────────────
 
 

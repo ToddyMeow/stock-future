@@ -1,181 +1,123 @@
-# Agent Handoff — 项目状态快照
+# HANDOFF — Minimal Context
 
-## 项目概述
+**项目**：中国期货量化趋势跟踪回测（日线）。91 个品种，2018-01 至 2025-12。
 
-中国期货量化趋势跟踪系统。可组合的入场/出场策略矩阵，多策略共用资金池，基于相关性的品种分组风控。
-
-**仓库**: `git@github.com:ToddyMeow/stock-future.git`
-**数据**: `data/cache/normalized/hab_bars.csv` (11MB, 91 symbols, 2018-2025 日线)
+**仓库**：`git@github.com:ToddyMeow/stock-future.git` / 分支 `main`
 
 ---
 
-## 架构
+## 先读这两个文件
 
-```
-config.yaml                    ← 所有超参数的唯一来源
-strats/
-  engine.py                    ← StrategyEngine 编排器 + EngineConfig + PendingEntry/Position/BacktestResult
-  protocols.py                 ← EntryStrategy / ExitStrategy Protocol
-  helpers.py                   ← wilder_smooth, wilder_atr, adx, direction helpers, PortfolioAnalyzer
-  config_loader.py             ← load_config() + build_engine() 从 YAML 构建引擎
-  entries/                     ← 7 个入场策略
-    hl_entry.py                  HLEntryStrategy (N日通道突破)
-    boll_break_entry.py          BollBreakEntryStrategy (布林带突破)
-    ama_entry.py                 AmaEntryStrategy (Kaufman自适应均线)
-    double_ma_entry.py           DoubleMaEntryStrategy (双均线交叉)
-    hab_entry.py                 HABEntryStrategy (横盘蓄势箱体突破)
-    rand_entry.py                RandEntryStrategy (随机入场基准)
-    donchian_entry.py            DonchianEntryStrategy (alias → HLEntry)
-  exits/                       ← 8 个出场策略
-    hl_exit.py                   HLExitStrategy (通道反向)
-    boll_exit.py                 BollExitStrategy (布林带反向)
-    ama_exit.py                  AmaExitStrategy (AMA翻转)
-    atr_trail_exit.py            AtrTrailExitStrategy (ATR移动止损)
-    term_exit.py                 TermExitStrategy (定期平仓)
-    double_ma_exit.py            DoubleMaExitStrategy (双均线交叉)
-    hab_exit.py                  HABExitStrategy (结构/时间失败 + ATR跟踪)
-    rand_exit.py                 RandExitStrategy (随机出场基准)
-data/adapters/
-  futures_static_meta.py       ← FUTURES_GROUP_MAP (品种→组), EXCLUDED_SYMBOLS, FuturesMeta
-  rqdata_futures_adatpter.py   ← RQData 数据适配器
-```
+- 📐 [ARCHITECTURE.md](ARCHITECTURE.md) — 静态分层图 + 所有设计决策索引
+- [strats/engine.py](strats/engine.py) `StrategyEngine` — 主编排器（1660 LOC）
 
-### 核心 API
+## 快速验证
 
-```python
-# 方式 1: 从 config.yaml 构建
-from strats.config_loader import load_config, build_engine
-engine = build_engine(load_config())
-result = engine.run(bars)
-
-# 方式 2: 手动构建多策略
-from strats.engine import StrategyEngine, EngineConfig, StrategySlot
-engine = StrategyEngine(
-    config=EngineConfig(...),
-    strategies=[
-        StrategySlot("hl_9", HLEntryStrategy(...), HLExitStrategy(...)),
-        StrategySlot("ama", AmaEntryStrategy(...), HABExitStrategy(...)),
-    ],
-)
-```
-
-### R 的定义
-
-R = `stop_atr_mult × ATR(atr_period)`，由引擎统一计算，入场策略不管止损。
-`initial_stop = close ∓ R`（多头减、空头加）。
-
-### ADX 趋势滤波器
-
-```
-trend_score = clip(ADX(20) / adx_scale, adx_floor, 1.0)
-effective_risk = risk_per_trade × trend_score
-```
-震荡时自动缩仓（ADX<10 → 仅 20% 仓位），不影响信号生成。
-
----
-
-## 品种分组（基于 Pearson 相关性聚类）
-
-| 组 | 品种 | 组内相关 | group_risk_cap |
-|----|------|---------|---------------|
-| equity_index | IC, IF, IM | 0.79 | 4% |
-| bond | T, TL, TS | 0.82 | 4% |
-| chem_energy | BU, EB, EG, FU, L, MA, PF, PG, PP, SC, TA, V | 0.55 | 6% |
-| rubber_fiber | CF, CY, RU, SR | 0.42 | 6% |
-| metals | AG, AL, AU, CU, NI, PB, SN, SS, ZN | 0.38 | 6% |
-| black_steel | I, J, JM, RB, SF, ZC | 0.32 | 6% |
-| agri | A, B, C, CS, M, OI, P, PK, RM, RS, Y | 0.29 | 6% |
-| building | AO, FG, LC, SA, SH, SI, SM, SP, UR, WR | 0.23 | 5% |
-| livestock | JD, LH | 0.17 | 4% |
-| independent (12个) | AP,BB,CJ,EC,FB,JR,LR,LU,PM,RI,RR,WH | 0.02 | 每品种2%, 合计8% |
-
-排除品种: BC,PR,PX,NR,HC,IH,TF,BR,LG,AD,BZ,OP,PD,PT,PP_F,V_F,L_F
-
----
-
-## 已完成的回测结果
-
-### Long+Short 全组 OOS 验证（70/30 split, 无 ADX）
-
-| 组 | 通过 OOS | 最佳组合 | 测试 Sharpe | 测试 CAGR |
-|----|---------|---------|-----------|---------|
-| **building** | 10/10 全过 | hl_21+atr_trail | 1.51 | +45.5% |
-| **metals** | 1 pass | ama+ama | 0.36 | +5.9% |
-| **livestock** | 9/10 pass | hl_9+boll | 0.24 | +2.3% |
-| **rubber_fiber** | 7/10 pass | boll+term_2_13 | 0.89 | +12.2% |
-| **black_steel** | 2 pass (弱) | hl_9+boll | 0.03 | -3.6% |
-| agri | 全崩 | — | — | — |
-| chem_energy | 全崩 | — | — | — |
-| bond | 无 survivors | — | — | — |
-| equity_index | 无交易 | — | — | — |
-
----
-
-## 当前中断的任务
-
-### 1. 后台回测正在运行 (Task ID: bc26b67nr)
-
-**任务**: 三层回测（策略层 × 品种组层 × 组合层），ADX ON/OFF 对比，allow_short=True，全 9 组 × 35 组合。
-
-**关键修复**: 回测脚本中必须用 `FUTURES_GROUP_MAP` 覆盖 CSV 里的旧 `group_name`：
-```python
-bars['group_name'] = bars['symbol'].map(FUTURES_GROUP_MAP).fillna(bars['group_name'])
-```
-CSV 里的 `group_name` 是旧值（commodity/black/index），和新分组（chem_energy/black_steel/agri 等）不匹配。
-
-**输出文件**:
-- `data/backtest_strategy_layer.csv` — 每行 = group × combo × adx × year
-- `data/backtest_group_layer.csv` — 每行 = group × year (含 avg_adx)
-
-**需要的后续分析** (等回测完):
-- 策略层: Top combos per group, 逐年 Sharpe/PF, 退出原因分布, ADX ON vs OFF 对比
-- 品种组层: 组内品种贡献分布, 信号密度逐年, 平均 ADX 逐年
-- 组合层: 合并资金曲线, 组间逐年归因, 最长连续亏损, 风控利用率
-
-### 2. CSV group_name 未更新
-
-`data/cache/normalized/hab_bars.csv` 中的 `group_name` 列仍然是旧值。需要重新运行数据管道 (`scripts/download_rqdata_futures.py`) 或手动更新 CSV。**临时方案**: 在回测脚本中用 `FUTURES_GROUP_MAP` 覆盖（已在最新回测脚本中实现）。
-
-### 3. config.yaml 中的 allow_short 还是 false
-
-用户希望做多做空并行。config.yaml 里 `allow_short: false`，但回测脚本中手动设了 True。后续需要决定 config.yaml 的默认值。
-
----
-
-## 测试状态
-
-40 个测试全过 (33 HAB engine + 7 Donchian entry)。
 ```bash
-cd strats && python -m pytest test_horizontal_accumulation_breakout_v1.py entries/test_donchian_entry.py -q
+python -m pytest -q           # 期望 144 passing
+cat data/cache/normalized/hab_bars.csv | head -1    # 22 列正常
 ```
-
-**旧门面已删除**: `horizontal_accumulation_breakout_v1.py` 不存在了。测试直接用 `EngineConfig` + `HABEntryConfig` + `HABExitConfig`，通过 `make_test_engine()` helper 构建。
 
 ---
 
-## 关键技术决策记录
+## 数据管道（按顺序）
 
-1. **R 统一由引擎定义** — 入场不管止损, R = stop_atr_mult × ATR, config.yaml 一处调
-2. **ADX 趋势滤波器** — 震荡时缩仓而非停止交易, `trend_score = clip(ADX/30, 0.2, 1.0)`
-3. **ATR NaN 修复** — `wilder_smooth()` 遇 NaN 保持前值, 不再永久传播
-4. **PendingEntry/Position 用 metadata dict** — 策略特有字段不硬编码
-5. **group_risk_cap 从 float → Dict** — 每组独立上限, 基于组内相关性
-6. **independent 品种** — 12 个低相关品种不设组限, 合计 soft cap 8%
-7. **品种排除** — 高相关冗余对 (BC-CU 0.99) 和数据不足品种
+一次性全流程（假设 `.env` 里 `RQDATAC_USER` + `RQDATAC_PASSWORD` 已配）：
+
+```bash
+python scripts/build_trading_calendar.py              # 1.1 — 交易日历
+python scripts/download_rqdata_futures.py \
+  --config scripts/download_rqdata_futures.cfg \
+  --overwrite                                          # OHLC + settle
+python scripts/download_dominant_contracts.py         # 1.2 — 合约代码
+python scripts/download_limit_prices.py               # 1.8 — 涨跌停板价
+python scripts/fetch_commission_specs.py              # 5.2 — 真实费率
+python scripts/build_enhanced_bars.py                 # 合并 + OHLC 修复
+python scripts/apply_commissions.py                   # 5.2 补丁（可选，future download 已自动）
+```
+
+**产物**：`data/cache/normalized/hab_bars.csv`（22 列，~135k 行）
 
 ---
 
-## Group Avg ADX by Year (参考)
+## 关键 invariants（不要破坏）
 
-```
-Group             2018   2019   2020   2021   2022   2023   2024   2025
-agri              23.7   24.4   24.8   19.2   22.4   20.7   20.8   16.7
-black_steel       19.7   20.3   24.0   26.4   19.2   23.7   22.3   22.8
-bond              27.8   22.9   23.9   19.5   18.1   22.5   22.1   22.2
-building          43.6   25.3   22.5   24.4   18.9   24.1   22.7   22.7
-chem_energy       25.6   23.1   23.3   20.6   18.4   19.4   18.0   20.7
-equity_index      22.9   19.2   20.4   17.5   25.2   20.4   26.0   23.1
-livestock         28.2   22.3   32.1   23.5   20.0   21.2   18.3   23.6
-metals            20.7   21.7   24.0   20.7   20.7   19.5   23.9   18.9
-rubber_fiber      27.3   20.2   23.2   18.6   21.9   21.4   20.3   19.5
-```
+1. `date` 必须是交易日 — adapter 层通过 `TradingCalendar.validate_trading_days` 强制
+2. 信号在 T 收盘、执行在 T+1 开盘（= 21:00 夜盘开）。永远不能同 bar 开平。不变量测试：[strats/test_execution_policy.py](strats/test_execution_policy.py)
+3. `settle` 驱动逐日盯市 / 保证金占用；`close` 驱动指标计算。entries/exits 不得引用 settle（静态扫描测试保护）
+4. `entries/`、`exits/` 都通过 `Protocol` 约束，不用继承
+5. `hab_bars.csv` 的 `date` 列是真实交易日（回归测试检验）；h < l 等硬错永远 raise，不要 auto-repair
+
+---
+
+## Gotchas（踩过的坑）
+
+- **Panama close 在 I/P/LU/EC 等深偏移品种会变负**。用 `|close|` 或 `close_raw` 做 commission / limit-lock 比较
+- **`margin_rate` 在 4.1 之前完全不被引擎使用**。只有 `max_margin_utilization > 0` 时才有 cap gate 激活
+- **默认关闭的配置**：`warmup_bars=0` / `max_limit_days=0` / `max_margin_utilization=0` / `min_atr_pct=0.0025`。生产推荐值见 `EngineConfig` docstring
+- **dual-stream（1.2）需要 `enable_dual_stream=True`** — 才启用 per-contract 段账户 + 真实 roll 成本。否则退回 Panama 单流
+- **89 个品种默认 commission 占位符 5 yuan 在 5.2 已替换为 RQData 真实费率**（by_money / by_volume）。如果你看到 commission 列全 5.0，说明 `apply_commissions.py` 没跑过
+- **RQData 的 `future_commission_margin` 只给当前快照**，没有历史 per-day 费率（这是 5.2 选 symbol-level static + tier schedule 而不是 per-day 的原因）
+- **OHLC 有 166 行 close/settle 超出 [low, high]**（低流动性品种锁死 + settle 修正），`ohlc_repair.py` method B 在 adapter 自动扩包 high/low
+
+---
+
+## 已完成的结构性审计（详情见 ARCHITECTURE.md）
+
+- **1.1** 夜盘归属 → `TradingCalendar` + adapter 校验
+- **1.2** 连续合约 → Panama 单流默认 + 可选 dual-stream + `_check_and_apply_roll`
+- **1.3** settle vs close → 逐日 mark 用 settle，指标用 close
+- **1.4** OHLC 坏数据 → 方式 B 扩包修复 + `ATR_BELOW_FLOOR` + DQ 报告
+- **1.5/1.6** 信号时点 + look-ahead → 零代码改动 + 不变量测试
+- **1.7** 指标预热 → `warmup_bars` 门禁（默认 0）
+- **1.8/1.10** 涨跌停 + gap-open → `_cannot_fill_side` + sizing 底线
+- **4.1** 保证金 cap → `max_margin_utilization` + tier schedule
+- **5.2** 真实费率 → `commission_specs.json` + by_money/by_volume 分流
+- **5.3** 盯市公式 → 已被 1.3 等价覆盖，零代码
+
+## 故意 deferred（不要重开）
+
+| 项 | 原因 |
+|---|---|
+| 5.1 平今/平昨 lot tracking | 2.06% 日线 trades 同日开平，~250 LOC 不值 |
+| 4.2 交割月硬检查 | 活跃品种 dominant auto-roll 已保护；低流动性品种被 ATR floor + limit-lock 间接过滤 |
+| ratio-adjusted 连续合约 | Panama 对点值指标（ATR/Donchian/BB）等价；深偏移会生成负价 |
+| forced_close 追保模拟 | 入场期 cap 已足；追保模型需要 engine 新状态机，无明确 ROI |
+| StrategyEngine.run() 拆 phase 方法 | 400 行内部有清晰 `# 0. 1. 2...` 注释；外部不可见 |
+
+---
+
+## 品种分组（`data/adapters/futures_static_meta.py::FUTURES_GROUP_MAP`）
+
+| 组 | 品种 | group_risk_cap |
+|----|------|---------------|
+| equity_index | IC, IF, IM | 4% |
+| bond | T, TL, TS | 4% |
+| metals | AG, AL, AU, CU, NI, PB, SN, SS, ZN | 6% |
+| black_steel | I, J, JM, RB, SF, ZC | 6% |
+| chem_energy | BU, EB, EG, FU, L, MA, PF, PG, PP, SC, TA, V | 6% |
+| rubber_fiber | CF, CY, RU, SR | 6% |
+| agri | A, B, C, CS, M, OI, P, PK, RM, RS, Y | 6% |
+| building | AO, FG, LC, SA, SH, SI, SM, SP, UR, WR | 5% |
+| livestock | JD, LH | 4% |
+| independent (12 个低相关) | AP, BB, CJ, EC, FB, JR, LR, LU, PM, RI, RR, WH | 每品种 2%，合计 8% |
+
+**排除（`EXCLUDED_SYMBOLS`）**：BC, PR, PX, NR, HC, IH, TF, BR, LG, AD, BZ, OP, PD, PT, PP_F, V_F, L_F
+
+---
+
+## 开发守则
+
+- **Karpathy #2 Simplicity**：新加 feature 前先 push back — 有没有数据证明问题真实？我们的默认是否已覆盖？
+- **Karpathy #3 Surgical**：不重构没坏的；每行改动追得到用户诉求
+- **测试先行**：改引擎行为 → 先加一条 invariant / behavior 测试；改策略 → 加回归测试
+- **commit 信息**：follow 已有风格（`feat(engine): XXX` / `fix(helpers): YYY` / `doc: ZZZ`）
+- **don't skip pre-commit hooks**；如 hook fail 则 fix 根因后重新 commit（不是 --amend）
+
+---
+
+## 上手建议（新 agent 前 3 件事）
+
+1. 跑 `python -m pytest -q`，确认 144 passing
+2. 读 [ARCHITECTURE.md](ARCHITECTURE.md) 5 分钟，建立分层心智模型
+3. 用 [scripts/run_three_layer_backtest.py](scripts/run_three_layer_backtest.py) 跑一次端到端感受产出
