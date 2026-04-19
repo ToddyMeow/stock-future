@@ -44,6 +44,17 @@ engine:
   risk_blowout_action: "SHRINK"
   allow_short: false
 
+  # ── Stop-and-Reverse (SAR) (v10) ─────────────────────────
+  # 开启后：任何 stop-out (STOP_GAP/STOP_INTRADAY) 平仓后，自动在
+  # 下一个 bar 的 open 反向开仓；反向仓的初始 stop = 当前 ATR ×
+  # reverse_stop_atr_mult，方向相反；最多级联 reverse_chain_max 次
+  # (第 N 次反向仓再被 stop-out 就不再翻转)。
+  # 反向仓走完整风控（portfolio_risk_cap、group_risk_cap、risk_blowout），
+  # trades 表里 metadata 带 entry_type=SAR_REVERSE + reverse_leg_count。
+  reverse_on_stop: false
+  reverse_stop_atr_mult: 3.0
+  reverse_chain_max: 3
+
 # ── 策略组合 ──────────────────────────────────────────────
 # 每个 strategy 是一个入场+出场配对，共享引擎资金池
 strategies:

@@ -14,7 +14,8 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import dataclass, field
-from typing import Any, Dict, FrozenSet, List, Literal, Optional, Tuple
+from datetime import date as _date_type
+from typing import Any, Dict, FrozenSet, List, Literal, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -27,6 +28,7 @@ from strats.helpers import (
     adverse_excursion,
     adx as _adx,
     wilder_atr as _wilder_atr,
+    choppiness_index as _choppiness_index,
     rolling_last_value_percentile as _rolling_last_value_percentile,
 )
 from strats.position import PendingEntry, Position
@@ -43,9 +45,14 @@ __all__ = [
 class StrategyEngine:
     """Composable backtest engine accepting pluggable entry/exit strategies.
 
-    This is the forward-looking API. For the HAB-specific legacy API, use
-    ``HorizontalAccumulationBreakoutV1`` which wraps this engine with
-    HABEntryStrategy + HABExitStrategy.
+    Two execution modes:
+      * batch        — engine.run(bars) runs a full historical backtest.
+      * incremental  — engine.run(bars, initial_state=result.save_state())
+                       resumes from a prior run; positions, cash, pending
+                       entries, and enough raw bars for indicator warmup
+                       are restored from the state. Only dates in the new
+                       bars slice drive today's trading. Used by
+                       live/signal_service to produce daily orders.
     """
 
     # Direction helpers delegate to module-level functions in helpers.py
@@ -227,10 +234,51 @@ class StrategyEngine:
         out = out.sort_values([cfg.date_col, cfg.symbol_col]).reset_index(drop=True)
         return out
 
-    def run(self, bars: pd.DataFrame) -> BacktestResult:
+    def run(
+        self,
+        bars: pd.DataFrame,
+        initial_state: Optional[Dict[str, Any]] = None,
+        warmup_until: Optional[Union[pd.Timestamp, _date_type, str]] = None,
+    ) -> BacktestResult:
+        """Run the backtest.
+
+        batch mode:
+            engine.run(bars) — processes every date in `bars`.
+        incremental mode:
+            engine.run(new_bars, initial_state=prior_result.save_state())
+            Splices a raw-bars tail from `initial_state` onto the front of
+            `new_bars` so indicator rolling windows are warmed up, then
+            restores positions/cash/pending_entries and runs the main
+            loop only over `new_bars`' dates.
+        warmup-only mode (2026-04-20 新增):
+            engine.run(bars, warmup_until=<date>) — bars 里 date ≤ warmup_until
+            的段 **只累积指标 / 更新 last_close_by_symbol**，不填单、不开仓、
+            不记 trade、不追加 portfolio_daily 行；bars 里 date > warmup_until
+            的段按正常交易逻辑处理。用于实盘"从很早日期重跑出干净 indicator
+            snapshot，positions 仍为空 / 完全由 DB 提供"。
+
+        Returns a BacktestResult whose `engine_state` is a JSON-compatible
+        snapshot suitable for a future `initial_state`, and whose
+        `pending_entries` DataFrame lists every newly-generated order
+        across the processed dates.
+        """
         cfg = self.config
         data_quality_report = self._compute_data_quality_report(bars)
-        prepared_by_strategy = self._prepare_all_strategies(bars)
+
+        # ---- incremental: merge warmup bars from initial_state ----
+        resume_state = initial_state or {}
+        state_last_date: Optional[pd.Timestamp] = None
+        if resume_state.get("last_date"):
+            state_last_date = pd.Timestamp(resume_state["last_date"]).normalize()
+
+        # ---- warmup-only cutoff: dates ≤ cutoff skip trading; only indicators update ----
+        warmup_until_ts: Optional[pd.Timestamp] = None
+        if warmup_until is not None:
+            warmup_until_ts = pd.Timestamp(warmup_until).normalize()
+
+        bars_for_prepare = self._merge_warmup_bars(bars, resume_state)
+
+        prepared_by_strategy = self._prepare_all_strategies(bars_for_prepare)
 
         # Use the first strategy's prepared data for backward compat
         # (daily_status, prepared_data in result, and date extraction)
@@ -259,9 +307,18 @@ class StrategyEngine:
                 prepared_data=prepared,
                 cancelled_entries=self._empty_cancelled_entries_frame(),
                 data_quality_report=data_quality_report,
+                pending_entries=self._empty_pending_entries_frame(),
+                engine_state=self._build_initial_engine_state_empty(),
             )
 
-        dates = list(pd.Index(prepared[cfg.date_col]).drop_duplicates().sort_values())
+        all_dates = list(pd.Index(prepared[cfg.date_col]).drop_duplicates().sort_values())
+        # In incremental mode, we process dates strictly AFTER the prior
+        # state's last_date. Earlier dates were consumed only to warm up
+        # indicator rolling windows.
+        if state_last_date is not None:
+            dates = [d for d in all_dates if d > state_last_date]
+        else:
+            dates = all_dates
 
         # Pre-index rows by date for the first strategy (used for phases 1-4)
         rows_by_date: Dict[pd.Timestamp, pd.DataFrame] = {
@@ -289,6 +346,9 @@ class StrategyEngine:
         # At step 0 (roll check) these hold yesterday's values; step 4 updates
         # them to today's values for tomorrow's iteration.
         last_raw_close_by_symbol: Dict[str, float] = {}
+        # Track, per processed date, the signals that were promoted to
+        # pending entries. Drives the public `pending_entries` DataFrame.
+        per_day_new_pending: List[Dict[str, Any]] = []
 
         # Decide the marking column once (1.3): prefer `settle` if it's in the
         # prepared frame, else fall back to `close`. The variable name
@@ -299,6 +359,20 @@ class StrategyEngine:
         )
 
         cash = float(cfg.initial_capital)
+
+        # ---- incremental: restore state ----
+        if resume_state:
+            cash = float(resume_state.get("cash", cash))
+            for pos_d in resume_state.get("positions", []):
+                pos = self._position_from_state_dict(pos_d)
+                positions[(pos.symbol, pos.strategy_id)] = pos
+            for pe_d in resume_state.get("pending_entries", []):
+                pe = self._pending_entry_from_state_dict(pe_d)
+                pending_entries[(pe.symbol, pe.strategy_id)] = pe
+            for sym, v in resume_state.get("last_close_by_symbol", {}).items():
+                last_close_by_symbol[str(sym)] = float(v)
+            for sym, v in resume_state.get("last_raw_close_by_symbol", {}).items():
+                last_raw_close_by_symbol[str(sym)] = float(v)
 
         for date in dates:
             day_df = rows_by_date[date]
@@ -314,6 +388,19 @@ class StrategyEngine:
                 if cfg.enable_dual_stream
                 else {}
             )
+
+            # warmup-only 分支（2026-04-20）：date ≤ warmup_until_ts 时
+            # 只更新 last_close_by_symbol（给后续 indicator state 做收尾），
+            # 跳过所有 position / pending / trade / portfolio_daily 的变更。
+            # 保证最终 engine_state 里 positions/pending=空，cash=初始值；
+            # 指标快照（last_close_by_symbol + warmup_bars tail）正常累积。
+            if warmup_until_ts is not None and date <= warmup_until_ts:
+                for _, row in day_df.iterrows():
+                    sym = str(row[cfg.symbol_col])
+                    last_close_by_symbol[sym] = float(row[mark_col_effective])
+                    if cfg.enable_dual_stream:
+                        last_raw_close_by_symbol[sym] = float(row[mark_raw_col_effective])
+                continue
 
             # 0) Dual-stream: if any open position's contract changed today,
             #    close the prior segment and start a new one. Must run BEFORE
@@ -336,14 +423,44 @@ class StrategyEngine:
                 keys_for_symbol = [k for k in positions if k[0] == symbol]
                 for key in keys_for_symbol:
                     position = positions[key]
-                    exit_record = self._process_open_and_intraday_for_existing_position(
+                    exit_records = self._process_open_and_intraday_for_existing_position(
                         position=position,
                         row=row,
                     )
-                    if exit_record is not None:
+                    for exit_record in exit_records:
                         cash += float(exit_record.pop("cash_delta"))
+                        is_partial = bool(exit_record.pop("is_partial", False))
+                        # Preserve exit_reason for SAR hook before closed_trades.append
+                        exit_reason_closed = exit_record.get("exit_reason", "")
                         closed_trades.append(exit_record)
-                        del positions[key]
+                        if not is_partial:
+                            del positions[key]
+                            # v10: stop-and-reverse synthesis (position var still
+                            # refers to the just-closed Position after del).
+                            # Per-slot SAR: check slot override before firing.
+                            slot_sar_on, _, _ = self._resolve_slot_sar(
+                                position.strategy_id
+                            )
+                            if (
+                                slot_sar_on
+                                and exit_reason_closed in cfg.reverse_eligible_reasons
+                            ):
+                                equity_est = (
+                                    float(portfolio_daily[-1]["equity"])
+                                    if portfolio_daily
+                                    else cash
+                                )
+                                reverse_pending = self._try_synthesize_reverse_entry(
+                                    closed_position=position,
+                                    row=row,
+                                    equity_estimate=equity_est,
+                                    positions=positions,
+                                    pending_entries=pending_entries,
+                                    close_map=close_map,
+                                    last_close_by_symbol=last_close_by_symbol,
+                                )
+                                if reverse_pending is not None:
+                                    pending_entries[key] = reverse_pending
 
             # 2) Pending entries fill at today's open.
             for _, row in day_df.iterrows():
@@ -450,14 +567,42 @@ class StrategyEngine:
                     positions[key] = position
                     del pending_entries[key]
 
-                    immediate_exit_record = self._process_open_and_intraday_for_existing_position(
+                    immediate_records = self._process_open_and_intraday_for_existing_position(
                         position=position,
                         row=row,
                     )
-                    if immediate_exit_record is not None:
+                    for immediate_exit_record in immediate_records:
                         cash += float(immediate_exit_record.pop("cash_delta"))
+                        is_partial = bool(immediate_exit_record.pop("is_partial", False))
+                        imm_exit_reason = immediate_exit_record.get("exit_reason", "")
                         closed_trades.append(immediate_exit_record)
-                        del positions[key]
+                        if not is_partial:
+                            del positions[key]
+                            # v10: stop-and-reverse after same-bar stop-out of
+                            # newly filled entry. Per-slot SAR resolution.
+                            slot_sar_on, _, _ = self._resolve_slot_sar(
+                                position.strategy_id
+                            )
+                            if (
+                                slot_sar_on
+                                and imm_exit_reason in cfg.reverse_eligible_reasons
+                            ):
+                                equity_est = (
+                                    float(portfolio_daily[-1]["equity"])
+                                    if portfolio_daily
+                                    else cash
+                                )
+                                imm_reverse = self._try_synthesize_reverse_entry(
+                                    closed_position=position,
+                                    row=row,
+                                    equity_estimate=equity_est,
+                                    positions=positions,
+                                    pending_entries=pending_entries,
+                                    close_map=close_map,
+                                    last_close_by_symbol=last_close_by_symbol,
+                                )
+                                if imm_reverse is not None:
+                                    pending_entries[key] = imm_reverse
 
             # 3) Close-phase logic for surviving positions.
             for _, row in day_df.iterrows():
@@ -524,7 +669,18 @@ class StrategyEngine:
             else:
                 base_occupied_margin = 0.0
 
-            for slot in self._strategies:
+            # v9: optional per-day slot shuffle for order-sensitivity MC.
+            # Uses stdlib random seeded deterministically from (seed, date.toordinal())
+            # so each day has a reproducible permutation under a fixed global seed.
+            if cfg.slot_permutation_seed is None:
+                slot_iter = list(self._strategies)
+            else:
+                import random as _random
+                _rng = _random.Random((int(cfg.slot_permutation_seed), int(date.toordinal())))
+                slot_iter = list(self._strategies)
+                _rng.shuffle(slot_iter)
+
+            for slot in slot_iter:
                 slot_day = rows_by_date_by_strategy[slot.strategy_id].get(date)
                 if slot_day is None:
                     continue
@@ -558,6 +714,11 @@ class StrategyEngine:
                         reason = "NO_NEXT_TRADE_DATE"
                     elif key in positions:
                         reason = "ALREADY_IN_POSITION"
+                    elif cfg.symbol_position_lock and any(k[0] == symbol for k in positions):
+                        # v4a: another strategy already holds this symbol; first-fire wins.
+                        reason = "SYMBOL_LOCKED"
+                    elif cfg.symbol_position_lock and any(k[0] == symbol for k in pending_entries):
+                        reason = "SYMBOL_LOCKED"
                     elif key in pending_entries:
                         reason = "PENDING_ENTRY_EXISTS"
                     else:
@@ -574,7 +735,24 @@ class StrategyEngine:
                                 or atr_ref_val < cfg.min_atr_pct * abs(entry_estimate)
                             )
                         )
-                        if atr_below_floor:
+                        # v5: Congestion filter. Hard gate — requires BOTH
+                        # Choppiness Index < threshold AND ADX > threshold.
+                        # Missing inputs (NaN) are treated as "cannot confirm
+                        # trend" → congested (safer default than pass-through).
+                        congested = False
+                        if cfg.use_congestion_filter:
+                            cpi_val = row.get("cpi", np.nan)
+                            adx_val = row.get("adx", np.nan)
+                            if (
+                                not np.isfinite(cpi_val)
+                                or not np.isfinite(adx_val)
+                                or cpi_val >= cfg.congestion_cpi_threshold
+                                or adx_val < cfg.congestion_adx_threshold
+                            ):
+                                congested = True
+                        if congested:
+                            reason = "CONGESTION_LOCKED"
+                        elif atr_below_floor:
                             reason = "ATR_BELOW_FLOOR"
                         else:
                             contract_multiplier = float(row[cfg.multiplier_col])
@@ -638,9 +816,9 @@ class StrategyEngine:
 
                                     if portfolio_risk_if_filled > portfolio_cap + cfg.eps:
                                         reason = "PORTFOLIO_RISK_CAP"
-                                    elif group_risk_if_filled > group_cap + cfg.eps:
+                                    elif cfg.use_group_risk_cap and group_risk_if_filled > group_cap + cfg.eps:
                                         reason = "GROUP_RISK_CAP"
-                                    elif group_name.startswith("ind_"):
+                                    elif cfg.use_group_risk_cap and group_name.startswith("ind_"):
                                         ind_risk = sum(r for g, r in effective_open_risk_by_group.items() if g.startswith("ind_"))
                                         if ind_risk + order_risk > equity_close * cfg.independent_group_soft_cap + cfg.eps:
                                             reason = "INDEPENDENT_SOFT_CAP"
@@ -659,7 +837,7 @@ class StrategyEngine:
                                             reason = "MARGIN_CAP"
 
                                     if reason is None:
-                                        pending_entries[key] = PendingEntry(
+                                        new_pending = PendingEntry(
                                             symbol=symbol,
                                             strategy_id=slot.strategy_id,
                                             group_name=group_name,
@@ -677,9 +855,30 @@ class StrategyEngine:
                                             contract_multiplier_est=contract_multiplier,
                                             metadata=slot.entry_strategy.build_pending_entry_metadata(row),
                                         )
+                                        pending_entries[key] = new_pending
                                         accepted_today_risk_total += order_risk
                                         accepted_notional_today += new_notional
                                         accepted_margin_today += candidate_margin
+                                        # Record for result.pending_entries output.
+                                        contract_code = (
+                                            str(row[cfg.contract_col])
+                                            if cfg.contract_col in row.index
+                                            and pd.notna(row.get(cfg.contract_col))
+                                            else symbol
+                                        )
+                                        per_day_new_pending.append({
+                                            "generated_date": date,
+                                            "symbol": symbol,
+                                            "contract_code": contract_code,
+                                            "group_name": group_name,
+                                            "strategy_id": slot.strategy_id,
+                                            "action": "open",
+                                            "direction": "long" if direction == 1 else "short",
+                                            "target_qty": int(qty),
+                                            "entry_price_ref": float(entry_estimate),
+                                            "stop_loss_ref": float(initial_stop),
+                                            "entry_date": entry_date,
+                                        })
 
                     risk_reject[(date, symbol, slot.strategy_id)] = reason
 
@@ -707,8 +906,16 @@ class StrategyEngine:
                 ["exit_date", "symbol", "entry_date"]
             ).reset_index(drop=True)
 
-        # Daily status uses the first strategy's prepared data (backward compat)
-        daily_status = prepared.copy()
+        # Daily status uses the first strategy's prepared data (backward compat).
+        # In incremental mode, filter out warmup-only dates so the frame matches
+        # the dates we actually processed. warmup_until_ts 同理：这些日期只做
+        # indicator 累积，不参与 daily_status 输出。
+        daily_status_source = prepared
+        if state_last_date is not None:
+            daily_status_source = daily_status_source[daily_status_source[cfg.date_col] > state_last_date]
+        if warmup_until_ts is not None:
+            daily_status_source = daily_status_source[daily_status_source[cfg.date_col] > warmup_until_ts]
+        daily_status = daily_status_source.copy()
         risk_reject_df = pd.DataFrame(
             [
                 {
@@ -734,12 +941,51 @@ class StrategyEngine:
         ).reset_index(drop=True)
 
         open_positions_df = self._serialize_open_positions(positions)
-        portfolio_daily_df = pd.DataFrame(portfolio_daily).sort_values("date").reset_index(drop=True)
+        # 2026-04-20 修复：增量续跑"0 新 bar"场景（session_date > bars.max_date，没处理任何新日期）
+        # portfolio_daily 为空 list，直接 sort_values("date") 会 KeyError。
+        # 下游 L874 的 `if not empty` 分支已经兜住空 frame，这里只需避开 sort。
+        if portfolio_daily:
+            portfolio_daily_df = pd.DataFrame(portfolio_daily).sort_values("date").reset_index(drop=True)
+        else:
+            portfolio_daily_df = pd.DataFrame()
         cancelled_entries_df = self._empty_cancelled_entries_frame()
         if cancelled_entries:
             cancelled_entries_df = pd.DataFrame(cancelled_entries).sort_values(
                 ["cancel_date", "symbol", "entry_date"]
             ).reset_index(drop=True)
+
+        pending_entries_df = self._build_pending_entries_df(per_day_new_pending)
+
+        # Determine the terminal processed date for state.last_date. Prefer
+        # the last date in portfolio_daily (every trading-day processed appends
+        # one row). 2026-04-20 新增：warmup_until 模式下，warmup 日期不会追加
+        # portfolio_daily，但这些日期已经被处理过（indicator / last_close 都
+        # 更新了），last_date 应落在 warmup_until_ts 或 bars 里最后一个 warmup
+        # 日期（取较小者；避免"将来日期"越界）。否则回退到 state_last_date，
+        # 再否则为 None（纯空 slice）。
+        if not portfolio_daily_df.empty:
+            terminal_date = pd.Timestamp(portfolio_daily_df["date"].iloc[-1])
+        elif warmup_until_ts is not None and dates:
+            # dates 是 state_last_date 之后全部 prepared 日期；warmup-only
+            # 模式下全部 ≤ warmup_until_ts。取 min(max(dates), warmup_until_ts)
+            # 作为 terminal：既不会超出 bars 的实际覆盖，又能吃到 warmup 边界。
+            max_processed = pd.Timestamp(max(dates))
+            terminal_date = min(max_processed, warmup_until_ts)
+        elif state_last_date is not None:
+            terminal_date = state_last_date
+        else:
+            terminal_date = None
+
+        engine_state = self._build_engine_state(
+            cash=cash,
+            positions=positions,
+            pending_entries=pending_entries,
+            last_close_by_symbol=last_close_by_symbol,
+            last_raw_close_by_symbol=last_raw_close_by_symbol,
+            terminal_date=terminal_date,
+            original_bars=bars,
+            merged_bars=bars_for_prepare,
+        )
 
         return BacktestResult(
             trades=trades_df,
@@ -749,6 +995,8 @@ class StrategyEngine:
             prepared_data=prepared,
             cancelled_entries=cancelled_entries_df,
             data_quality_report=data_quality_report,
+            pending_entries=pending_entries_df,
+            engine_state=engine_state,
         )
 
     def _validate_input_columns(self, bars: pd.DataFrame) -> None:
@@ -849,6 +1097,9 @@ class StrategyEngine:
         out["atr"] = _wilder_atr(high=high, low=low, close=close, period=cfg.atr_period)
         out["atr_ref"] = out["atr"].shift(1)
         out["adx"] = _adx(high=high, low=low, close=close, period=cfg.adx_period)
+        # v5: Choppiness Index for the congestion filter. Cheap to compute
+        # unconditionally; the gate itself is disabled by default.
+        out["cpi"] = _choppiness_index(high=high, low=low, close=close, period=cfg.cpi_period)
         out["next_trade_date"] = out[cfg.date_col].shift(-1)
         # Per-symbol bar index (0-based), used by the warmup gate (1.7).
         out["_bar_index"] = np.arange(len(out), dtype=int)
@@ -1139,8 +1390,14 @@ class StrategyEngine:
         self,
         position: Position,
         row: pd.Series,
-    ) -> Optional[Dict[str, Any]]:
+    ) -> List[Dict[str, Any]]:
+        """Returns list of trade records. A single bar may produce multiple
+        records when a profit target partial-close fires before the intraday
+        stop on the remaining qty. Each record has `is_partial: bool` so the
+        caller knows whether to delete the position."""
         cfg = self.config
+        records: List[Dict[str, Any]] = []
+
         # Stop CHECKS stay in Panama space — the stop was computed from Panama ATR.
         open_price = float(row[cfg.open_col])
         high_price = float(row[cfg.high_col])
@@ -1153,20 +1410,17 @@ class StrategyEngine:
 
         # Limit-lock block (1.8): if bar is fully locked against the exit side,
         # skip all fills today; the position stays open and retries next bar.
-        # Long → SELL on exit (blocked by locked-DOWN); Short → BUY (by locked-UP).
         exit_side = -d
         if self._cannot_fill_side(row, exit_side):
-            return None
-        # Under dual_stream, compute raw fills in parallel. Panama fills remain
-        # the display value in trade records; raw fills drive P&L via _close_position.
+            return records
         raw_offset = self._panama_to_raw_offset(row)
         raw_open = float(row[cfg.raw_open_col]) if cfg.enable_dual_stream else None
 
-        # 1) Gap stop
+        # 1) Gap stop — full close, done.
         gap_stop = (d == 1 and open_price <= position.active_stop) or \
                    (d == -1 and open_price >= position.active_stop)
         if gap_stop:
-            return self._close_position(
+            rec = self._close_position(
                 position=position, exit_date=date,
                 exit_fill=self._apply_exit_slippage(open_price, slippage, d),
                 raw_exit_fill=(
@@ -1176,10 +1430,13 @@ class StrategyEngine:
                 exit_reason="STOP_GAP", exit_slippage=slippage,
                 exit_commission_per_contract=exit_commission,
             )
+            rec["is_partial"] = False
+            records.append(rec)
+            return records
 
-        # 2) Pending exit
+        # 2) Pending exit — full close, done.
         if position.pending_exit_reason is not None and position.pending_exit_date == date:
-            return self._close_position(
+            rec = self._close_position(
                 position=position, exit_date=date,
                 exit_fill=self._apply_exit_slippage(open_price, slippage, d),
                 raw_exit_fill=(
@@ -1189,9 +1446,95 @@ class StrategyEngine:
                 exit_reason=position.pending_exit_reason, exit_slippage=slippage,
                 exit_commission_per_contract=exit_commission,
             )
+            rec["is_partial"] = False
+            records.append(rec)
+            return records
 
-        # 3) Intraday stop
-        if low_price <= position.active_stop <= high_price:
+        # 3a) v7 Breakeven ratchet — at N×ATR unrealized R, lift the stop
+        # to entry ± offset×ATR (but never loosen). Position stays open.
+        if (
+            cfg.breakeven_trigger_atr_r > 0.0
+            and not position.breakeven_triggered
+            and position.r_price > 0.0
+            and position.qty > 0
+        ):
+            trigger_level = position.entry_fill + d * cfg.breakeven_trigger_atr_r * position.r_price
+            be_hit = (d == 1 and high_price >= trigger_level) or (d == -1 and low_price <= trigger_level)
+            if be_hit:
+                new_stop = position.entry_fill + d * cfg.breakeven_stop_offset_atr * position.atr_ref
+                old_stop = position.active_stop
+                tighter = (d == 1 and new_stop > old_stop) or (d == -1 and new_stop < old_stop)
+                if tighter:
+                    position.active_stop = new_stop
+                    position.active_stop_series.append({
+                        "computed_on": date.strftime("%Y-%m-%d"),
+                        "effective_from": date.strftime("%Y-%m-%d"),
+                        "phase": "breakeven_ratchet",
+                        "active_stop_before": old_stop,
+                        "active_stop_after": new_stop,
+                        "trigger_level": float(trigger_level),
+                        "atr_used": position.atr_ref,
+                        "highest_high_since_entry": position.highest_high_since_entry,
+                    })
+                position.breakeven_triggered = True
+
+        # 3b) v6 Profit target — at N×ATR unrealized R, close a fraction.
+        if (
+            cfg.profit_target_atr_r > 0.0
+            and not position.profit_target_triggered
+            and position.r_price > 0.0
+            and position.qty > 0
+        ):
+            # Target price level
+            target_level = position.entry_fill + d * cfg.profit_target_atr_r * position.r_price
+            # Long: triggered when high crosses ≥ target. Short: when low crosses ≤ target.
+            hit = (d == 1 and high_price >= target_level) or (d == -1 and low_price <= target_level)
+            if hit:
+                # Fill price: gap beyond target favours us → use open when favourable.
+                if d == 1:
+                    fill_price = max(target_level, open_price)
+                else:
+                    fill_price = min(target_level, open_price)
+                fill_slipped = self._apply_exit_slippage(fill_price, slippage, d)
+                raw_fill: Optional[float] = None
+                if cfg.enable_dual_stream:
+                    raw_fill = self._apply_exit_slippage(fill_price - raw_offset, slippage, d)
+
+                frac = max(0.0, min(1.0, cfg.profit_target_close_fraction))
+                close_qty = int(round(position.qty * frac))
+                close_qty = max(1, min(close_qty, position.qty))
+
+                position.profit_target_triggered = True
+
+                tag = f"PROFIT_TARGET_{cfg.profit_target_atr_r:.1f}R"
+                if close_qty >= position.qty:
+                    # Full close path
+                    rec = self._close_position(
+                        position=position, exit_date=date,
+                        exit_fill=fill_slipped, raw_exit_fill=raw_fill,
+                        exit_reason=f"{tag}_FULL",
+                        exit_slippage=slippage,
+                        exit_commission_per_contract=exit_commission,
+                    )
+                    rec["is_partial"] = False
+                    records.append(rec)
+                    return records
+                else:
+                    # Partial close path — mutate position.qty, continue to stop check.
+                    rec = self._partial_close_position(
+                        position=position, exit_date=date,
+                        exit_fill=fill_slipped, raw_exit_fill=raw_fill,
+                        close_qty=close_qty,
+                        exit_reason=f"{tag}_PARTIAL",
+                        exit_slippage=slippage,
+                        exit_commission_per_contract=exit_commission,
+                    )
+                    rec["is_partial"] = True
+                    records.append(rec)
+                    # Fall through to check intraday stop on remaining qty.
+
+        # 4) Intraday stop — full close on remaining.
+        if position.qty > 0 and low_price <= position.active_stop <= high_price:
             position.mae_price = max(
                 position.mae_price,
                 self._adverse_excursion(position.active_stop, position.entry_fill, d),
@@ -1200,15 +1543,18 @@ class StrategyEngine:
             if cfg.enable_dual_stream:
                 raw_stop_price = position.active_stop - raw_offset
                 raw_stop_exit = self._apply_exit_slippage(raw_stop_price, slippage, d)
-            return self._close_position(
+            rec = self._close_position(
                 position=position, exit_date=date,
                 exit_fill=self._apply_exit_slippage(position.active_stop, slippage, d),
                 raw_exit_fill=raw_stop_exit,
                 exit_reason="STOP_INTRADAY", exit_slippage=slippage,
                 exit_commission_per_contract=exit_commission,
             )
+            rec["is_partial"] = False
+            records.append(rec)
+            return records
 
-        return None
+        return records
 
     def _process_close_phase(self, position: Position, row: pd.Series) -> None:
         self._exit_strategy.process_close_phase(
@@ -1280,6 +1626,154 @@ class StrategyEngine:
         )
         position.current_contract = today_contract
         position.segment_entry_fill = new_seg_entry
+
+    def _resolve_slot_sar(self, strategy_id: str) -> Tuple[bool, float, int]:
+        """Per-slot SAR resolution: slot-level override wins over EngineConfig.
+        Returns (reverse_on_stop, reverse_stop_atr_mult, reverse_chain_max).
+        Fallback to EngineConfig values if slot not found or slot override is None.
+        """
+        cfg = self.config
+        slot = self._strategy_map.get(strategy_id)
+        if slot is None:
+            return (
+                cfg.reverse_on_stop,
+                cfg.reverse_stop_atr_mult,
+                cfg.reverse_chain_max,
+            )
+        on = cfg.reverse_on_stop if slot.reverse_on_stop is None else slot.reverse_on_stop
+        mult = (
+            cfg.reverse_stop_atr_mult
+            if slot.reverse_stop_atr_mult is None
+            else slot.reverse_stop_atr_mult
+        )
+        chain = (
+            cfg.reverse_chain_max
+            if slot.reverse_chain_max is None
+            else slot.reverse_chain_max
+        )
+        return bool(on), float(mult), int(chain)
+
+    def _try_synthesize_reverse_entry(
+        self,
+        closed_position: Position,
+        row: pd.Series,
+        equity_estimate: float,
+        positions: Dict[Tuple[str, str], Position],
+        pending_entries: Dict[Tuple[str, str], PendingEntry],
+        close_map: Dict[str, float],
+        last_close_by_symbol: Dict[str, float],
+    ) -> Optional[PendingEntry]:
+        """Stop-and-reverse (v10): after a stop-out close, synthesize a
+        PendingEntry in the opposite direction sized from ATR × multiplier.
+
+        Returns the PendingEntry if all gates pass (non-NaN ATR, valid
+        next_trade_date, chain not maxed, risk caps respected, qty>=1),
+        else None. Caller inserts into pending_entries dict.
+
+        Skips trend_score scaling intentionally — SAR is a reactionary
+        re-entry, not a fresh trend-confirmed signal. Uses base
+        risk_per_trade × current equity for sizing.
+        """
+        cfg = self.config
+        # Per-slot SAR params (slot override > EngineConfig default)
+        _slot_on, slot_atr_mult, slot_chain_max = self._resolve_slot_sar(
+            closed_position.strategy_id
+        )
+        prev_leg_count = int(closed_position.metadata.get("reverse_leg_count", 0))
+        if prev_leg_count >= slot_chain_max:
+            return None
+
+        raw_ntd = row.get("next_trade_date")
+        if raw_ntd is None or pd.isna(raw_ntd):
+            return None
+        next_trade_date = pd.Timestamp(raw_ntd)
+
+        atr_ref_val = (
+            float(row["atr_ref"]) if pd.notna(row.get("atr_ref")) else float("nan")
+        )
+        if not np.isfinite(atr_ref_val) or atr_ref_val <= 0.0:
+            return None
+
+        new_direction = -closed_position.direction
+        entry_estimate = float(row[cfg.close_col])
+        stop_offset = atr_ref_val * slot_atr_mult
+        if stop_offset <= cfg.eps:
+            return None
+        initial_stop = (
+            entry_estimate - stop_offset
+            if new_direction == 1
+            else entry_estimate + stop_offset
+        )
+
+        contract_multiplier = float(row[cfg.multiplier_col])
+        per_contract_risk_est = stop_offset * contract_multiplier
+        if per_contract_risk_est <= cfg.eps:
+            return None
+
+        # Use base risk_per_trade — no ADX trend scaling for reversal trades.
+        risk_budget_single = equity_estimate * cfg.risk_per_trade
+        qty = math.floor(risk_budget_single / per_contract_risk_est)
+        if qty < 1:
+            return None
+
+        order_risk = per_contract_risk_est * qty
+        group_name = closed_position.group_name
+
+        # Block duplicate slot-key (shouldn't happen right after close, but defensive)
+        key = (closed_position.symbol, closed_position.strategy_id)
+        if key in positions or key in pending_entries:
+            return None
+
+        # Risk cap gates (portfolio + group). Mirror phase-6 signal-gen
+        # logic but reuse equity_estimate (yesterday's equity_close or
+        # initial_capital pre-day-1).
+        effective_open_risk, effective_open_risk_by_group = (
+            self._compute_effective_open_risk_for_entry_date(
+                candidate_entry_date=next_trade_date,
+                positions=positions,
+                pending_entries=pending_entries,
+                close_map=close_map,
+                last_close_by_symbol=last_close_by_symbol,
+            )
+        )
+        portfolio_cap = equity_estimate * cfg.portfolio_risk_cap
+        if group_name.startswith("ind_"):
+            group_cap = equity_estimate * cfg.default_group_risk_cap
+        else:
+            group_cap = equity_estimate * cfg.group_risk_cap.get(
+                group_name, cfg.default_group_risk_cap
+            )
+        if effective_open_risk + order_risk > portfolio_cap + cfg.eps:
+            return None
+        if (
+            cfg.use_group_risk_cap
+            and effective_open_risk_by_group.get(group_name, 0.0) + order_risk
+            > group_cap + cfg.eps
+        ):
+            return None
+
+        metadata: Dict[str, Any] = {
+            "entry_type": "SAR_REVERSE",
+            "reverse_leg_count": prev_leg_count + 1,
+        }
+        return PendingEntry(
+            symbol=closed_position.symbol,
+            strategy_id=closed_position.strategy_id,
+            group_name=group_name,
+            direction=new_direction,
+            signal_date=pd.Timestamp(row[cfg.date_col]),
+            entry_date=next_trade_date,
+            entry_estimate=entry_estimate,
+            qty=qty,
+            atr_ref=atr_ref_val,
+            volume=float(row[cfg.volume_col]),
+            open_interest=float(row[cfg.open_interest_col]),
+            initial_stop=initial_stop,
+            estimated_initial_risk=stop_offset,
+            estimated_order_risk=order_risk,
+            contract_multiplier_est=contract_multiplier,
+            metadata=metadata,
+        )
 
     def _close_position(
         self,
@@ -1375,6 +1869,120 @@ class StrategyEngine:
             "cash_delta": cash_delta,
         }
         record.update(position.metadata)
+        return record
+
+    def _partial_close_position(
+        self,
+        position: Position,
+        exit_date: pd.Timestamp,
+        exit_fill: float,
+        exit_reason: str,
+        exit_slippage: float,
+        exit_commission_per_contract: float,
+        close_qty: int,
+        raw_exit_fill: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Close `close_qty` contracts (partial). Mutates position.qty down
+        and prorates roll_cost. Commissions are charged only on the closed
+        portion — entry commission for the remaining qty is paid at final
+        close. Returns a trade record (includes cash_delta)."""
+        cfg = self.config
+        if close_qty <= 0 or close_qty >= position.qty:
+            raise ValueError(
+                f"_partial_close_position: close_qty {close_qty} must be in (0, {position.qty})"
+            )
+        full_qty = position.qty  # snapshot before mutation
+        frac = close_qty / full_qty
+
+        if cfg.enable_dual_stream and position.segment_entry_fill is not None:
+            if raw_exit_fill is None:
+                raise ValueError("dual_stream _partial_close_position missing raw_exit_fill")
+            partial_segment_pnl = (
+                self._directional_pnl(raw_exit_fill, position.segment_entry_fill, position.direction)
+                * position.contract_multiplier
+                * close_qty
+            )
+            realized_portion = position.realized_segment_pnl * frac
+            gross_pnl = realized_portion + partial_segment_pnl
+            position.realized_segment_pnl -= realized_portion
+        else:
+            gross_pnl = (
+                self._directional_pnl(exit_fill, position.entry_fill, position.direction)
+                * position.contract_multiplier
+                * close_qty
+            )
+
+        entry_comm = position.entry_commission_per_contract * close_qty
+        exit_comm = exit_commission_per_contract * close_qty
+        roll_cost_portion = float(position.roll_cost_accrued) * frac
+        position.roll_cost_accrued -= roll_cost_portion
+
+        net_pnl = gross_pnl - entry_comm - exit_comm - roll_cost_portion
+        cash_delta = gross_pnl - exit_comm - roll_cost_portion  # entry_comm paid at entry
+
+        r_money_partial = position.r_money * frac
+        r_money_abs = max(abs(r_money_partial), cfg.eps)
+        r_multiple = net_pnl / r_money_abs
+        mfe_r = position.mfe_price / max(abs(position.r_price), cfg.eps)
+        mae_r = position.mae_price / max(abs(position.r_price), cfg.eps)
+
+        record: Dict[str, Any] = {
+            "symbol": position.symbol,
+            "strategy_id": position.strategy_id,
+            "group_name": position.group_name,
+            "direction": position.direction,
+            "signal_date": position.signal_date,
+            "entry_date": position.entry_date,
+            "entry_fill_date": position.entry_date,
+            "entry_estimate": position.entry_estimate,
+            "entry_fill": position.entry_fill,
+            "qty": close_qty,
+            "contract_multiplier": position.contract_multiplier,
+            "atr_ref": position.atr_ref,
+            "volume": position.volume,
+            "open_interest": position.open_interest,
+            "initial_stop": position.initial_stop,
+            "active_stop_series": json.dumps(position.active_stop_series, ensure_ascii=False),
+            "estimated_initial_risk": position.estimated_initial_risk * frac,
+            "estimated_order_risk": position.estimated_order_risk * frac,
+            "actual_initial_risk": position.actual_initial_risk * frac,
+            "actual_order_risk": position.actual_order_risk * frac,
+            "risk_blowout_vs_estimate": position.risk_blowout_vs_estimate,
+            "risk_blowout_ratio": position.risk_blowout_ratio,
+            "original_qty": position.original_qty,
+            "qty_shrink_reason": position.qty_shrink_reason,
+            "exit_date": exit_date,
+            "exit_fill": exit_fill,
+            "exit_reason": exit_reason,
+            "r_price": position.r_price,
+            "r_money": r_money_partial,
+            "r_multiple": r_multiple,
+            "mfe": position.mfe_price,
+            "mae": position.mae_price,
+            "mfe_r": mfe_r,
+            "mae_r": mae_r,
+            "gross_pnl": gross_pnl,
+            "net_pnl": net_pnl,
+            "entry_slippage": position.entry_slippage,
+            "exit_slippage": exit_slippage,
+            "entry_commission_total": entry_comm,
+            "exit_commission_total": exit_comm,
+            "raw_entry_fill": position.raw_entry_fill,
+            "raw_exit_fill": raw_exit_fill,
+            "entry_contract": (
+                position.rolls_crossed[0]["old_contract"]
+                if position.rolls_crossed else position.current_contract
+            ),
+            "exit_contract": position.current_contract,
+            "rolls_crossed": len(position.rolls_crossed),
+            "roll_cost_total": roll_cost_portion,
+            "rolls_detail": json.dumps(position.rolls_crossed, ensure_ascii=False),
+            "cash_delta": cash_delta,
+        }
+        record.update(position.metadata)
+
+        # Mutate position in place — remaining qty continues to be managed.
+        position.qty -= close_qty
         return record
 
     def _compute_equity_close(
@@ -1658,3 +2266,322 @@ class StrategyEngine:
                 "cancel_reason",
             ]
         )
+
+    # ── Incremental run support (P1a) ────────────────────────────────
+
+    # Minimum number of history bars per symbol carried over as warmup
+    # between incremental runs. Must exceed the largest rolling window
+    # used by any entry/exit strategy (HL 21, double_ma 34, boll 22,
+    # HAB box 7 + bb 20 + percentile lookback 60, AMA slow 30, ATR/ADX
+    # up to 10× their 20 period for EMA convergence). 500 is safe and
+    # cheap — stored raw bars are a small dict, not a DataFrame.
+    _INCREMENTAL_WARMUP_BARS = 500
+
+    def _empty_pending_entries_frame(self) -> pd.DataFrame:
+        return pd.DataFrame(columns=[
+            "generated_date", "symbol", "contract_code", "group_name",
+            "strategy_id", "action", "direction", "target_qty",
+            "entry_price_ref", "stop_loss_ref", "entry_date",
+        ])
+
+    def _build_pending_entries_df(
+        self, rows: List[Dict[str, Any]]
+    ) -> pd.DataFrame:
+        if not rows:
+            return self._empty_pending_entries_frame()
+        df = pd.DataFrame(rows)
+        cols = [
+            "generated_date", "symbol", "contract_code", "group_name",
+            "strategy_id", "action", "direction", "target_qty",
+            "entry_price_ref", "stop_loss_ref", "entry_date",
+        ]
+        return df[cols].sort_values(
+            ["generated_date", "symbol", "strategy_id"]
+        ).reset_index(drop=True)
+
+    # ---- warmup bars handling ----
+
+    def _merge_warmup_bars(
+        self, bars: pd.DataFrame, resume_state: Dict[str, Any]
+    ) -> pd.DataFrame:
+        """In incremental mode, prepend the warmup-bar tail from
+        `resume_state` to `bars` so rolling indicators stay valid.
+
+        Warmup rows are de-duplicated against `bars` on (date, symbol):
+        callers can overlap safely.
+
+        In batch mode (no warmup_bars in state), returns `bars` unchanged.
+        """
+        cfg = self.config
+        warmup_records = resume_state.get("warmup_bars")
+        if not warmup_records:
+            return bars
+        warmup_df = pd.DataFrame(warmup_records)
+        # Normalize date column to datetime for consistent concat/dedup.
+        if cfg.date_col in warmup_df.columns:
+            warmup_df[cfg.date_col] = pd.to_datetime(warmup_df[cfg.date_col])
+        if bars.empty:
+            merged = warmup_df
+        else:
+            # Ensure all columns in bars are preserved; fill absent warmup
+            # columns with NaN via a union.
+            merged = pd.concat([warmup_df, bars], axis=0, ignore_index=True, sort=False)
+        # Drop duplicate (date, symbol) keeping the LAST occurrence so
+        # anything in the freshly-provided `bars` wins.
+        merged = merged.drop_duplicates(
+            subset=[cfg.date_col, cfg.symbol_col], keep="last"
+        ).reset_index(drop=True)
+        return merged
+
+    def _extract_warmup_bars(self, merged_bars: pd.DataFrame) -> List[Dict[str, Any]]:
+        """Tail of `merged_bars` kept as raw state for the next incremental
+        run. Takes the last N trading dates system-wide and returns all
+        rows on those dates.
+        """
+        cfg = self.config
+        if merged_bars is None or merged_bars.empty:
+            return []
+        dates = (
+            pd.Index(merged_bars[cfg.date_col])
+            .drop_duplicates()
+            .sort_values()
+        )
+        if len(dates) == 0:
+            return []
+        n = min(self._INCREMENTAL_WARMUP_BARS, len(dates))
+        tail_dates = set(dates[-n:])
+        tail = merged_bars[merged_bars[cfg.date_col].isin(tail_dates)].copy()
+        # Coerce timestamps to ISO strings for JSON compatibility.
+        tail[cfg.date_col] = pd.to_datetime(tail[cfg.date_col]).dt.strftime("%Y-%m-%d")
+        return tail.to_dict(orient="records")
+
+    # ---- state <-> dict converters ----
+
+    def _position_to_state_dict(self, pos: Position) -> Dict[str, Any]:
+        def _ts(x):
+            return pd.Timestamp(x).strftime("%Y-%m-%d") if pd.notna(x) else None
+        return {
+            "symbol": pos.symbol,
+            "strategy_id": pos.strategy_id,
+            "group_name": pos.group_name,
+            "direction": int(pos.direction),
+            "signal_date": _ts(pos.signal_date),
+            "entry_date": _ts(pos.entry_date),
+            "entry_estimate": float(pos.entry_estimate),
+            "entry_fill": float(pos.entry_fill),
+            "entry_slippage": float(pos.entry_slippage),
+            "qty": int(pos.qty),
+            "contract_multiplier": float(pos.contract_multiplier),
+            "entry_commission_per_contract": float(pos.entry_commission_per_contract),
+            "atr_ref": float(pos.atr_ref),
+            "volume": float(pos.volume),
+            "open_interest": float(pos.open_interest),
+            "initial_stop": float(pos.initial_stop),
+            "active_stop": float(pos.active_stop),
+            "estimated_initial_risk": float(pos.estimated_initial_risk),
+            "estimated_order_risk": float(pos.estimated_order_risk),
+            "actual_initial_risk": float(pos.actual_initial_risk),
+            "actual_order_risk": float(pos.actual_order_risk),
+            "risk_blowout_vs_estimate": float(pos.risk_blowout_vs_estimate),
+            "risk_blowout_ratio": (
+                float(pos.risk_blowout_ratio)
+                if pos.risk_blowout_ratio is not None
+                and np.isfinite(pos.risk_blowout_ratio)
+                else None
+            ),
+            "r_price": float(pos.r_price),
+            "r_money": float(pos.r_money),
+            "highest_high_since_entry": float(pos.highest_high_since_entry),
+            "lowest_low_since_entry": float(pos.lowest_low_since_entry),
+            "completed_bars": int(pos.completed_bars),
+            "pending_exit_reason": pos.pending_exit_reason,
+            "pending_exit_date": _ts(pos.pending_exit_date),
+            "active_stop_series": list(pos.active_stop_series),
+            "mfe_price": float(pos.mfe_price),
+            "mae_price": float(pos.mae_price),
+            "consecutive_fail_count": int(pos.consecutive_fail_count),
+            "original_qty": (
+                int(pos.original_qty) if pos.original_qty is not None else None
+            ),
+            "qty_shrink_reason": pos.qty_shrink_reason,
+            "profit_target_triggered": bool(pos.profit_target_triggered),
+            "breakeven_triggered": bool(pos.breakeven_triggered),
+            "metadata": _jsonable(pos.metadata),
+            "current_contract": pos.current_contract,
+            "raw_entry_fill": (
+                float(pos.raw_entry_fill) if pos.raw_entry_fill is not None else None
+            ),
+            "segment_entry_fill": (
+                float(pos.segment_entry_fill) if pos.segment_entry_fill is not None else None
+            ),
+            "realized_segment_pnl": float(pos.realized_segment_pnl),
+            "roll_cost_accrued": float(pos.roll_cost_accrued),
+            "rolls_crossed": list(pos.rolls_crossed),
+        }
+
+    def _position_from_state_dict(self, d: Dict[str, Any]) -> Position:
+        def _ts(x):
+            return pd.Timestamp(x) if x is not None else None
+        rbr = d.get("risk_blowout_ratio")
+        return Position(
+            symbol=d["symbol"],
+            strategy_id=d["strategy_id"],
+            group_name=d["group_name"],
+            direction=int(d["direction"]),
+            signal_date=_ts(d["signal_date"]),
+            entry_date=_ts(d["entry_date"]),
+            entry_estimate=float(d["entry_estimate"]),
+            entry_fill=float(d["entry_fill"]),
+            entry_slippage=float(d["entry_slippage"]),
+            qty=int(d["qty"]),
+            contract_multiplier=float(d["contract_multiplier"]),
+            entry_commission_per_contract=float(d["entry_commission_per_contract"]),
+            atr_ref=float(d["atr_ref"]),
+            volume=float(d["volume"]),
+            open_interest=float(d["open_interest"]),
+            initial_stop=float(d["initial_stop"]),
+            active_stop=float(d["active_stop"]),
+            estimated_initial_risk=float(d["estimated_initial_risk"]),
+            estimated_order_risk=float(d["estimated_order_risk"]),
+            actual_initial_risk=float(d["actual_initial_risk"]),
+            actual_order_risk=float(d["actual_order_risk"]),
+            risk_blowout_vs_estimate=float(d["risk_blowout_vs_estimate"]),
+            risk_blowout_ratio=float(rbr) if rbr is not None else float("nan"),
+            r_price=float(d["r_price"]),
+            r_money=float(d["r_money"]),
+            highest_high_since_entry=float(d["highest_high_since_entry"]),
+            lowest_low_since_entry=float(d["lowest_low_since_entry"]),
+            completed_bars=int(d.get("completed_bars", 0)),
+            pending_exit_reason=d.get("pending_exit_reason"),
+            pending_exit_date=_ts(d.get("pending_exit_date")),
+            active_stop_series=list(d.get("active_stop_series", [])),
+            mfe_price=float(d.get("mfe_price", 0.0)),
+            mae_price=float(d.get("mae_price", 0.0)),
+            consecutive_fail_count=int(d.get("consecutive_fail_count", 0)),
+            original_qty=(
+                int(d["original_qty"]) if d.get("original_qty") is not None else None
+            ),
+            qty_shrink_reason=d.get("qty_shrink_reason"),
+            profit_target_triggered=bool(d.get("profit_target_triggered", False)),
+            breakeven_triggered=bool(d.get("breakeven_triggered", False)),
+            metadata=dict(d.get("metadata", {})),
+            current_contract=d.get("current_contract"),
+            raw_entry_fill=(
+                float(d["raw_entry_fill"]) if d.get("raw_entry_fill") is not None else None
+            ),
+            segment_entry_fill=(
+                float(d["segment_entry_fill"]) if d.get("segment_entry_fill") is not None else None
+            ),
+            realized_segment_pnl=float(d.get("realized_segment_pnl", 0.0)),
+            roll_cost_accrued=float(d.get("roll_cost_accrued", 0.0)),
+            rolls_crossed=list(d.get("rolls_crossed", [])),
+        )
+
+    def _pending_entry_to_state_dict(self, pe: PendingEntry) -> Dict[str, Any]:
+        def _ts(x):
+            return pd.Timestamp(x).strftime("%Y-%m-%d") if pd.notna(x) else None
+        return {
+            "symbol": pe.symbol,
+            "strategy_id": pe.strategy_id,
+            "group_name": pe.group_name,
+            "direction": int(pe.direction),
+            "signal_date": _ts(pe.signal_date),
+            "entry_date": _ts(pe.entry_date),
+            "entry_estimate": float(pe.entry_estimate),
+            "qty": int(pe.qty),
+            "atr_ref": float(pe.atr_ref),
+            "volume": float(pe.volume),
+            "open_interest": float(pe.open_interest),
+            "initial_stop": float(pe.initial_stop),
+            "estimated_initial_risk": float(pe.estimated_initial_risk),
+            "estimated_order_risk": float(pe.estimated_order_risk),
+            "contract_multiplier_est": float(pe.contract_multiplier_est),
+            "metadata": _jsonable(pe.metadata),
+        }
+
+    def _pending_entry_from_state_dict(self, d: Dict[str, Any]) -> PendingEntry:
+        def _ts(x):
+            return pd.Timestamp(x) if x is not None else None
+        return PendingEntry(
+            symbol=d["symbol"],
+            strategy_id=d["strategy_id"],
+            group_name=d["group_name"],
+            direction=int(d["direction"]),
+            signal_date=_ts(d["signal_date"]),
+            entry_date=_ts(d["entry_date"]),
+            entry_estimate=float(d["entry_estimate"]),
+            qty=int(d["qty"]),
+            atr_ref=float(d["atr_ref"]),
+            volume=float(d["volume"]),
+            open_interest=float(d["open_interest"]),
+            initial_stop=float(d["initial_stop"]),
+            estimated_initial_risk=float(d["estimated_initial_risk"]),
+            estimated_order_risk=float(d["estimated_order_risk"]),
+            contract_multiplier_est=float(d["contract_multiplier_est"]),
+            metadata=dict(d.get("metadata", {})),
+        )
+
+    def _build_initial_engine_state_empty(self) -> Dict[str, Any]:
+        return {
+            "last_date": None,
+            "cash": float(self.config.initial_capital),
+            "positions": [],
+            "pending_entries": [],
+            "last_close_by_symbol": {},
+            "last_raw_close_by_symbol": {},
+            "warmup_bars": [],
+        }
+
+    def _build_engine_state(
+        self,
+        cash: float,
+        positions: Dict[Tuple[str, str], Position],
+        pending_entries: Dict[Tuple[str, str], PendingEntry],
+        last_close_by_symbol: Dict[str, float],
+        last_raw_close_by_symbol: Dict[str, float],
+        terminal_date: Optional[pd.Timestamp],
+        original_bars: pd.DataFrame,
+        merged_bars: pd.DataFrame,
+    ) -> Dict[str, Any]:
+        return {
+            "last_date": (
+                terminal_date.strftime("%Y-%m-%d")
+                if terminal_date is not None else None
+            ),
+            "cash": float(cash),
+            "positions": [self._position_to_state_dict(p) for p in positions.values()],
+            "pending_entries": [
+                self._pending_entry_to_state_dict(pe) for pe in pending_entries.values()
+            ],
+            "last_close_by_symbol": {
+                str(k): float(v) for k, v in last_close_by_symbol.items()
+            },
+            "last_raw_close_by_symbol": {
+                str(k): float(v) for k, v in last_raw_close_by_symbol.items()
+            },
+            "warmup_bars": self._extract_warmup_bars(merged_bars),
+        }
+
+
+def _jsonable(obj: Any) -> Any:
+    """Best-effort conversion to JSON-compatible primitives.
+
+    Keeps nested dicts/lists structural; maps pandas/numpy scalars to
+    native Python types; falls back to str() for unknown objects so we
+    never crash on an unexpected strategy metadata value.
+    """
+    if obj is None or isinstance(obj, (bool, int, float, str)):
+        return obj
+    if isinstance(obj, dict):
+        return {str(k): _jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_jsonable(v) for v in obj]
+    if isinstance(obj, (pd.Timestamp,)):
+        return obj.strftime("%Y-%m-%d")
+    if isinstance(obj, np.generic):
+        return obj.item()
+    # Unknown — degrade gracefully.
+    try:
+        return str(obj)
+    except Exception:
+        return None

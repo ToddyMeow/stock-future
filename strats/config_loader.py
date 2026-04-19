@@ -56,6 +56,17 @@ def build_engine_config(cfg: Dict[str, Any]) -> EngineConfig:
             "metals", "black_steel", "agri", "building", "livestock",
         ]}
 
+    # v10 Stop-and-reverse (SAR): allow yaml override, default OFF.
+    # reverse_eligible_reasons stays as EngineConfig default tuple
+    # ('STOP_GAP', 'STOP_INTRADAY') — not yaml-configurable for now.
+    sar_kwargs: Dict[str, Any] = {}
+    if "reverse_on_stop" in e:
+        sar_kwargs["reverse_on_stop"] = bool(e["reverse_on_stop"])
+    if "reverse_stop_atr_mult" in e:
+        sar_kwargs["reverse_stop_atr_mult"] = float(e["reverse_stop_atr_mult"])
+    if "reverse_chain_max" in e:
+        sar_kwargs["reverse_chain_max"] = int(e["reverse_chain_max"])
+
     return EngineConfig(
         initial_capital=float(e.get("initial_capital", 1_000_000)),
         atr_period=int(e.get("atr_period", 20)),
@@ -73,6 +84,7 @@ def build_engine_config(cfg: Dict[str, Any]) -> EngineConfig:
         adx_period=int(e.get("adx_period", 20)),
         adx_scale=float(e.get("adx_scale", 30.0)),
         adx_floor=float(e.get("adx_floor", 0.2)),
+        **sar_kwargs,
     )
 
 

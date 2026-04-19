@@ -7,7 +7,7 @@ continue `from strats.engine import EngineConfig, StrategySlot`.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, FrozenSet, Literal
+from typing import Any, Dict, FrozenSet, Literal, Optional, Tuple
 
 
 @dataclass(frozen=True)
@@ -113,6 +113,67 @@ class EngineConfig:
     max_portfolio_leverage: float = 3.0
     default_margin_rate: float = 0.10
 
+    # v4: Per-symbol architecture toggles. Defaults preserve legacy group-based
+    # behaviour; v4 runner flips them on to disable GROUP_RISK_CAP and enforce
+    # first-fire-wins-per-symbol via SYMBOL_LOCKED gate.
+    use_group_risk_cap: bool = True
+    symbol_position_lock: bool = False
+
+    # v5: Congestion filter. Hard gate that rejects signals when the market
+    # is range-bound / choppy. Uses the intersection of two classical metrics:
+    #   - Choppiness Index (Dreiss, 14-bar default): congested when >= cpi_threshold
+    #   - ADX (existing `adx_period`):               congested when <  adx_threshold
+    # A signal passes only when BOTH agree the market is trending.
+    # Default: OFF (backward-compatible).
+    use_congestion_filter: bool = False
+    cpi_period: int = 14
+    congestion_cpi_threshold: float = 61.8   # >= → congested
+    congestion_adx_threshold: float = 25.0   # <  → congested
+
+    # v6: Profit target exit. When the position's unrealized profit (in R)
+    # reaches `profit_target_atr_r`, close `profit_target_close_fraction` of
+    # the position at market. close_fraction=1.0 → full close; 0.5 → half
+    # (partial), remaining qty stays open under the normal exit strategy.
+    # Triggered once per position; afterwards the position never re-triggers
+    # (profit_target_triggered flag). Default: disabled.
+    profit_target_atr_r: float = 0.0         # 0 = disabled
+    profit_target_close_fraction: float = 1.0  # 1.0 = full close
+
+    # v7: Breakeven stop ratchet. Once unrealized profit reaches
+    # `breakeven_trigger_atr_r` in R units, lift the stop to
+    # `entry_fill ± breakeven_stop_offset_atr × atr_ref` (long: +, short: -),
+    # but only if this new stop is tighter than the current `active_stop`
+    # (never loosen). Unlike profit target, this does NOT close the position —
+    # it just protects the profit. Existing exit strategies continue to manage
+    # the stop upward. Triggered once per position.
+    breakeven_trigger_atr_r: float = 0.0         # 0 = disabled
+    breakeven_stop_offset_atr: float = 0.0       # 0 = pure breakeven; 1.0 = entry + 1×ATR
+
+    # v9: Per-day slot permutation for signal-evaluation order. When None
+    # (default), slots are iterated in the order they were passed to the
+    # engine — preserving legacy behaviour. When set to an int seed, each
+    # trading date's slot order is randomized with a deterministic RNG
+    # seeded from (seed, date.toordinal()). Use for Monte-Carlo-style
+    # diagnostics of how much strategy performance depends on slot ordering
+    # under the portfolio_risk_cap gate.
+    slot_permutation_seed: Optional[int] = None
+
+    # v10: Stop-and-reverse (SAR). When reverse_on_stop is True, after any
+    # position closes with an exit_reason in reverse_eligible_reasons, the
+    # engine synthesizes a reverse PendingEntry (opposite direction) sized
+    # from `ATR × reverse_stop_atr_mult` independently of the entry
+    # strategy's stop logic. The reverse entry fills on the next bar's open
+    # and is subject to the normal risk caps (portfolio_cap, group_cap,
+    # risk_blowout). Chains until a non-eligible exit reason fires OR until
+    # `reverse_chain_max` reversals have happened on the same slot/symbol.
+    # Metadata stores `entry_type` ("SIGNAL" | "SAR_REVERSE") and
+    # `reverse_leg_count` (0 = fresh, 1..N = reverse legs) so trades output
+    # preserves attribution. Default OFF (backward-compatible).
+    reverse_on_stop: bool = False
+    reverse_eligible_reasons: Tuple[str, ...] = ("STOP_GAP", "STOP_INTRADAY")
+    reverse_stop_atr_mult: float = 3.0
+    reverse_chain_max: int = 3
+
     # Shared technical
     atr_period: int = 20
     adx_period: int = 20
@@ -136,8 +197,17 @@ class EngineConfig:
 
 @dataclass
 class StrategySlot:
-    """Pairs one entry strategy with one exit strategy under a unique ID."""
+    """Pairs one entry strategy with one exit strategy under a unique ID.
+
+    v10: each slot may optionally override SAR behaviour. When a field is
+    left as None, the engine falls back to the global EngineConfig value.
+    This lets a mixed portfolio run some slots with stop-and-reverse and
+    others without, all in the same engine instance.
+    """
 
     strategy_id: str
     entry_strategy: Any
     exit_strategy: Any
+    reverse_on_stop: Optional[bool] = None
+    reverse_stop_atr_mult: Optional[float] = None
+    reverse_chain_max: Optional[int] = None
