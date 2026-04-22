@@ -1,7 +1,6 @@
 # Architecture Snapshot
 
-Static snapshot of the repo's layered structure. For change history + per-issue
-audit trail, see [HANDOFF.md](HANDOFF.md). For runnable how-to, see the usage
+Static snapshot of the repo's layered structure. For runnable usage, see the
 section at the top of [strats/engine.py](strats/engine.py).
 
 ```
@@ -100,7 +99,7 @@ section at the top of [strats/engine.py](strats/engine.py).
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-## Key design decisions (cross-reference HANDOFF.md for details)
+## Key design decisions
 
 - **1.1 Trading calendar** — every `date` must be a trading day; enforced at
   adapter ingestion. [data/adapters/trading_calendar.py](data/adapters/trading_calendar.py)
@@ -156,4 +155,4 @@ section at the top of [strats/engine.py](strats/engine.py).
 - `strats/` — engine core, execution policy, dual stream, data quality,
   limit lock, margin cap, warmup, HAB strategy, donchian entry
 - `scripts/` — download_rqdata_futures smoke
-- **Total: 138 passing**. Run with `python -m pytest -q`.
+- Run with `python -m pytest -q`.

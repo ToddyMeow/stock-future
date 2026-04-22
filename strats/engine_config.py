@@ -45,7 +45,7 @@ class EngineConfig:
     group_col: str = "group_name"
     margin_rate_col: str = "margin_rate"
 
-    # Dual-stream P&L (see 1.2 in HANDOFF.md). When enabled, bars must carry
+    # Dual-stream P&L. When enabled, bars must carry
     # per-contract raw prices + order_book_id; entries/exits fill on raw, P&L
     # is segment-accounted across rolls, roll_cost applied explicitly.
     # Indicators and stops remain in Panama space (the `open`/`high`/`low`/
@@ -57,7 +57,7 @@ class EngineConfig:
     raw_close_col: str = "close_raw"
     contract_col: str = "order_book_id"
 
-    # Settle price (see 1.3 in HANDOFF.md). China futures settle = daily VWAP
+    # Settle price. China futures settle = daily VWAP
     # (or last hour VWAP on CFFEX), used for mark-to-market, margin, and risk
     # caps. Technical indicators + signal still read `close` (last trade).
     # If the column is absent from bars, the engine silently falls back to

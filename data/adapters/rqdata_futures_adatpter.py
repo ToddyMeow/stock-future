@@ -162,8 +162,8 @@ class RQDataFuturesResearchAdapter:
         if self._repair_ohlc:
             # Envelope [low, high] around open/close/settle so every row
             # satisfies OHLC sanity. Limit-lock + settle alignment would
-            # otherwise leave close/settle outside the traded range (method B
-            # from 1.4 HANDOFF). h<l stays broken if it was broken.
+            # otherwise leave close/settle outside the traded range. h<l stays
+            # broken if it was broken.
             repair_ohlc_envelope(
                 out, high_col="high", low_col="low",
                 enveloped_cols=["open", "close", "settle"],
