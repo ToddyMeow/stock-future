@@ -27,12 +27,11 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from scripts.report_baseline import derive_best_combos
-from scripts.run_three_layer_backtest import (
-    build_entries, build_exits, load_bars, make_engine_config,
-)
+from scripts.research.report_baseline import derive_best_combos
 from strats.engine import StrategyEngine, StrategySlot
+from strats.factory import build_engine_config, build_entries, build_exits
 from strats.helpers import PortfolioAnalyzer
+from strats.research_support import GROUPS, load_hab_bars
 
 
 SWEEPS: dict[str, list] = {
@@ -76,7 +75,6 @@ def _apply_preset(base_cfg, preset: dict):
     overrides = {k: v for k, v in preset.items() if k != "group_uniform"}
     cfg = replace(base_cfg, **overrides)
     if "group_uniform" in preset:
-        from scripts.run_three_layer_backtest import GROUPS
         uniform = preset["group_uniform"]
         cfg = replace(cfg, group_risk_cap={g: uniform for g in GROUPS})
     return cfg
@@ -86,7 +84,7 @@ def sweep_risk_presets(bars, entries, exits, best_combos) -> pd.DataFrame:
     rows: list[dict] = []
     for name, preset in RISK_PRESETS.items():
         t0 = time.time()
-        engine_cfg = _apply_preset(make_engine_config(), preset)
+        engine_cfg = _apply_preset(build_engine_config(profile="research"), preset)
         label = f"{name}: risk={preset['risk_per_trade']*100:.0f}%  " \
                 f"group={preset.get('group_uniform', 'dict')}  " \
                 f"port={preset['portfolio_risk_cap']*100:.0f}%"
@@ -127,23 +125,26 @@ def main() -> None:
                         help="Compare A vs B risk-tier presets (skip 1-D sweeps).")
     args = parser.parse_args()
 
-    file_suffix = f"_{args.suffix}" if args.suffix else ""
-    group_csv = ROOT / "data" / f"backtest_group_layer{file_suffix}.csv"
+    run_name = args.suffix or "default"
+    group_csv = ROOT / "data" / "runs" / run_name / "backtest_group_layer.csv"
     if not group_csv.exists():
         print(f"ERROR: {group_csv} not found — run baseline first", file=sys.stderr)
         sys.exit(1)
 
+    sens_dir = ROOT / "data" / "sensitivity"
+    sens_dir.mkdir(parents=True, exist_ok=True)
+
     best_combos = derive_best_combos(group_csv)
     print(f"Best combos: {json.dumps(best_combos)}")
 
-    bars = load_bars()
+    bars = load_hab_bars()
     entries = build_entries()
     exits = build_exits()
 
     if args.risk_preset:
         print(f"\n=== Risk-preset comparison (A vs B tiers) ===")
         df = sweep_risk_presets(bars, entries, exits, best_combos)
-        out = ROOT / "data" / "sensitivity_risk_preset.csv"
+        out = sens_dir / "sensitivity_risk_preset.csv"
         df.to_csv(out, index=False)
         print(f"  -> Saved: {out}")
         return
@@ -158,10 +159,10 @@ def main() -> None:
         for val in values:
             t0 = time.time()
             if param == "adx_floor" and val == 1.0:
-                engine_cfg = make_engine_config(adx_off=True)
+                engine_cfg = build_engine_config(profile="research", adx_off=True)
                 label = f"{param}=1.0 (ADX off)"
             else:
-                engine_cfg = replace(make_engine_config(), **{param: val})
+                engine_cfg = replace(build_engine_config(profile="research"), **{param: val})
                 label = f"{param}={val}"
             try:
                 stats = run_point(bars, engine_cfg, entries, exits, best_combos)
@@ -188,7 +189,7 @@ def main() -> None:
                        "total_trades": 0, "win_rate": float("nan")}
             rows.append(row)
 
-        out = ROOT / "data" / f"sensitivity_{param}.csv"
+        out = sens_dir / f"sensitivity_{param}.csv"
         pd.DataFrame(rows).to_csv(out, index=False)
         print(f"  -> Saved: {out}")
 

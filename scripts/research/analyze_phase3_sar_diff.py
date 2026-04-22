@@ -11,7 +11,7 @@ Output:
     SAR trigger count/pct, average reverse chain depth.
 
 Usage:
-  python scripts/analyze_phase3_sar_diff.py \\
+  python scripts/research/analyze_phase3_sar_diff.py \\
       --baseline-tag risk3cap8_baseline --sar-tag risk3cap8_sar
 """
 from __future__ import annotations
@@ -22,7 +22,7 @@ from pathlib import Path
 
 import pandas as pd
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 PHASE3_DIR = ROOT / "data" / "runs" / "phase3"

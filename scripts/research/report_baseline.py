@@ -8,8 +8,8 @@ utilisation and data-quality snapshot.
 Also supports --start / --end for regime slicing (Step 6 of the plan).
 
 Usage:
-    python scripts/report_baseline.py --suffix baseline
-    python scripts/report_baseline.py --suffix baseline --start 2020-01-01 --end 2020-06-30
+    python scripts/research/report_baseline.py --suffix baseline
+    python scripts/research/report_baseline.py --suffix baseline --start 2020-01-01 --end 2020-06-30
 """
 from __future__ import annotations
 
@@ -22,14 +22,13 @@ from pathlib import Path
 
 import pandas as pd
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from scripts.run_three_layer_backtest import (
-    build_entries, build_exits, make_engine_config, load_bars,
-)
 from strats.engine import StrategyEngine, StrategySlot
+from strats.factory import build_engine_config, build_entries, build_exits
 from strats.helpers import PortfolioAnalyzer
+from strats.research_support import load_hab_bars
 
 
 def derive_best_combos(group_csv: Path) -> dict[str, str]:
@@ -96,8 +95,8 @@ def main() -> None:
                         help="Override stop_atr_mult (must match the original backtest run).")
     args = parser.parse_args()
 
-    file_suffix = f"_{args.suffix}" if args.suffix else ""
-    group_csv = ROOT / "data" / f"backtest_group_layer{file_suffix}.csv"
+    run_name = args.suffix or "default"
+    group_csv = ROOT / "data" / "runs" / run_name / "backtest_group_layer.csv"
     if not group_csv.exists():
         print(f"ERROR: {group_csv} not found — run baseline first", file=sys.stderr)
         sys.exit(1)
@@ -109,7 +108,7 @@ def main() -> None:
 
     # Re-run Layer 3 to recover full BacktestResult.
     # Any CLI overrides MUST match the original run to get consistent metrics.
-    bars = load_bars()
+    bars = load_hab_bars()
     risk_overrides: dict = {}
     if args.risk_per_trade is not None:
         risk_overrides["risk_per_trade"] = args.risk_per_trade
@@ -117,7 +116,11 @@ def main() -> None:
         risk_overrides["portfolio_risk_cap"] = args.portfolio_risk_cap
     if args.stop_atr_mult is not None:
         risk_overrides["stop_atr_mult"] = args.stop_atr_mult
-    engine_cfg = make_engine_config(adx_off=args.adx_off, risk_overrides=risk_overrides or None)
+    engine_cfg = build_engine_config(
+        profile="research",
+        overrides=risk_overrides or None,
+        adx_off=args.adx_off,
+    )
     entries = build_entries()
     exits = build_exits()
     slots = [

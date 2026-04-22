@@ -1,0 +1,17 @@
+# live/ 模块依赖（P1b + P1c 批次合并）
+# 安装：pip install -r live/requirements.txt
+psycopg[binary]>=3.1
+python-dotenv>=1.0
+pydantic>=2.0
+# P1c 批次追加：
+fastapi>=0.100
+uvicorn[standard]>=0.23
+sqlalchemy[asyncio]>=2.0
+asyncpg>=0.29
+jinja2>=3.1
+httpx>=0.25
+aliyun-python-sdk-core>=2.13
+aliyun-python-sdk-dysmsapi>=2.2
+# 测试用：
+aiosqlite>=0.19
+pytest-asyncio>=1.0

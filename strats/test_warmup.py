@@ -8,7 +8,7 @@ from typing import Any, Dict
 import pandas as pd
 import pytest
 
-from strats.engine import EngineConfig, StrategyEngine
+from strats.engine import EngineConfig, StrategyEngine, StrategySlot
 
 
 @dataclass(frozen=True)
@@ -61,8 +61,13 @@ def _run(bars, *, signal_date: str, warmup_bars: int):
     )
     return StrategyEngine(
         config=cfg,
-        entry_strategy=_ScriptedEntry(_ScriptedEntryConfig(pd.Timestamp(signal_date))),
-        exit_strategy=_NoopExit(),
+        strategies=[
+            StrategySlot(
+                "default",
+                _ScriptedEntry(_ScriptedEntryConfig(pd.Timestamp(signal_date))),
+                _NoopExit(),
+            )
+        ],
     ).run(bars)
 
 

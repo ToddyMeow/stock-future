@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  com.stockfuture.signal_day — 每交易日 02:40 产日盘指令
+
+  手动激活：
+    cp live/scheduler/com.stockfuture.signal_day.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.stockfuture.signal_day.plist
+  卸载：
+    launchctl unload ~/Library/LaunchAgents/com.stockfuture.signal_day.plist
+  立即手动触发一次：
+    launchctl start com.stockfuture.signal_day
+  日志：
+    tail -f /Users/mm/Trading/stock-future/live/logs/launchd/signal_day.{out,err}.log
+
+  依赖：data_after_nightclose (02:35) 要先跑完；留 5 分钟余量。
+  session=day 对应的 session_date 就是 T+1 日（日历日期），
+  用 $(date +%Y-%m-%d) 取凌晨时刻的日期即 T+1 正确。
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.stockfuture.signal_day</string>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/mm/Trading/stock-future</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>TZ</key>
+    <string>Asia/Shanghai</string>
+  </dict>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-lc</string>
+    <string>/Users/mm/opt/miniconda3/bin/python -m live.signal_service --date $(date +%Y-%m-%d) --session day</string>
+  </array>
+
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>2</integer>
+    <key>Minute</key>
+    <integer>50</integer>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>/Users/mm/Trading/stock-future/live/logs/launchd/signal_day.out.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/Users/mm/Trading/stock-future/live/logs/launchd/signal_day.err.log</string>
+
+  <key>RunAtLoad</key>
+  <false/>
+</dict>
+</plist>

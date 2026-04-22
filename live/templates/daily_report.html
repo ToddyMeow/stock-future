@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>每日报告 · {{ report_date }}</title>
+<style>
+  body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", Arial, sans-serif;
+         margin: 0; padding: 24px; background: #fafafa; color: #1f2937; }
+  h1 { margin-top: 0; }
+  .kpi-row { display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 24px; }
+  .kpi-card { flex: 1 1 160px; background: white; border-radius: 8px; padding: 16px;
+              box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+  .kpi-label { font-size: 12px; color: #6b7280; }
+  .kpi-value { font-size: 22px; font-weight: 600; margin-top: 4px; }
+  .kpi-value.green { color: #16a34a; }
+  .kpi-value.red   { color: #dc2626; }
+  section { background: white; border-radius: 8px; padding: 16px; margin-bottom: 16px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { padding: 6px 10px; border-bottom: 1px solid #e5e7eb; text-align: left; }
+  th { background: #f3f4f6; font-weight: 600; font-size: 12px; color: #374151; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 999px;
+           font-size: 11px; font-weight: 500; }
+  .badge-filled    { background: #dcfce7; color: #166534; }
+  .badge-partial   { background: #fef3c7; color: #92400e; }
+  .badge-pending   { background: #dbeafe; color: #1e40af; }
+  .badge-vetoed    { background: #fee2e2; color: #991b1b; }
+  .badge-skipped   { background: #e5e7eb; color: #374151; }
+  .badge-expired   { background: #fef9c3; color: #713f12; }
+  .chart-wrap { width: 100%; height: 200px; }
+  canvas { width: 100%; height: 100%; background: #f9fafb; border-radius: 6px; }
+  .meta { color: #6b7280; font-size: 12px; }
+</style>
+</head>
+<body>
+
+<h1>每日报告 · {{ report_date }}</h1>
+<p class="meta">生成时间：{{ generated_at }} · 系统 velvet-anchor</p>
+
+<!-- ========== KPI 卡片 ========== -->
+<div class="kpi-row">
+  <div class="kpi-card">
+    <div class="kpi-label">今日权益</div>
+    <div class="kpi-value">{{ "%.0f"|format(equity) }}</div>
+  </div>
+  <div class="kpi-card">
+    <div class="kpi-label">今日 PnL</div>
+    <div class="kpi-value {{ 'green' if pnl_today >= 0 else 'red' }}">
+      {{ "+%.0f"|format(pnl_today) if pnl_today >= 0 else "%.0f"|format(pnl_today) }}
+    </div>
+  </div>
+  <div class="kpi-card">
+    <div class="kpi-label">累计 PnL (30d)</div>
+    <div class="kpi-value {{ 'green' if pnl_30d >= 0 else 'red' }}">
+      {{ "+%.0f"|format(pnl_30d) if pnl_30d >= 0 else "%.0f"|format(pnl_30d) }}
+    </div>
+  </div>
+  <div class="kpi-card">
+    <div class="kpi-label">当前回撤</div>
+    <div class="kpi-value {{ 'red' if drawdown >= 0.03 else '' }}">
+      {{ "%.2f%%"|format(drawdown * 100) }}
+    </div>
+  </div>
+</div>
+
+<!-- ========== 权益曲线 ========== -->
+<section>
+  <h3>权益曲线（最近 30 个交易日）</h3>
+  <div class="chart-wrap">
+    <canvas id="equity-chart" width="800" height="200"></canvas>
+  </div>
+</section>
+
+<!-- ========== 指令执行汇总 ========== -->
+<section>
+  <h3>指令执行汇总</h3>
+  <p>
+    共 {{ instructions|length }} 条 ·
+    <span class="badge badge-filled">完全成交 {{ summary.fully_filled }}</span>
+    <span class="badge badge-partial">部分成交 {{ summary.partially_filled }}</span>
+    <span class="badge badge-vetoed">否决 {{ summary.vetoed }}</span>
+    <span class="badge badge-skipped">跳过 {{ summary.skipped }}</span>
+    <span class="badge badge-pending">未处理 {{ summary.pending }}</span>
+    <span class="badge badge-expired">过期 {{ summary.expired }}</span>
+  </p>
+
+  {% if instructions %}
+  <table>
+    <thead><tr>
+      <th>盘次</th><th>品种</th><th>合约</th><th>动作</th><th>方向</th>
+      <th>目标量</th><th>状态</th><th>否决原因</th>
+    </tr></thead>
+    <tbody>
+    {% for inst in instructions %}
+      <tr>
+        <td>{{ inst.session }}</td>
+        <td>{{ inst.symbol }}</td>
+        <td>{{ inst.contract_code }}</td>
+        <td>{{ inst.action }}</td>
+        <td>{{ inst.direction }}</td>
+        <td>{{ inst.target_qty }}</td>
+        <td><span class="badge badge-{{ inst.status|replace('_','-')|replace('fully-filled','filled')|replace('partially-filled','partial') }}">
+            {{ inst.status }}</span></td>
+        <td>{{ inst.veto_reason or "" }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+    <p class="meta">今日无指令产出。</p>
+  {% endif %}
+</section>
+
+<!-- ========== 人工否决归因 ========== -->
+{% if vetoed %}
+<section>
+  <h3>人工否决明细</h3>
+  <table>
+    <thead><tr><th>品种</th><th>动作</th><th>原因</th></tr></thead>
+    <tbody>
+    {% for v in vetoed %}
+      <tr><td>{{ v.symbol }}</td><td>{{ v.action }}</td><td>{{ v.veto_reason }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endif %}
+
+<script>
+  // 极简权益曲线（不引入 chart.js 以避免 CDN 依赖）
+  (function () {
+    const data = {{ equity_series_js | safe }};
+    if (!data || data.length === 0) return;
+    const cv = document.getElementById("equity-chart");
+    if (!cv) return;
+    const ctx = cv.getContext("2d");
+    const w = cv.width, h = cv.height;
+    const xs = data.map(d => d.t);
+    const ys = data.map(d => d.e);
+    const minY = Math.min(...ys), maxY = Math.max(...ys);
+    const pad = 20;
+    ctx.clearRect(0, 0, w, h);
+    ctx.strokeStyle = "#2563eb"; ctx.lineWidth = 2;
+    ctx.beginPath();
+    data.forEach((d, i) => {
+      const x = pad + (i / (data.length - 1 || 1)) * (w - 2 * pad);
+      const y = h - pad - ((d.e - minY) / (maxY - minY || 1)) * (h - 2 * pad);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+    // 起止标签
+    ctx.fillStyle = "#6b7280"; ctx.font = "11px sans-serif";
+    ctx.fillText(xs[0], pad, h - 4);
+    ctx.fillText(xs[xs.length - 1], w - pad - 60, h - 4);
+    ctx.fillText(maxY.toFixed(0), pad + 2, 12);
+    ctx.fillText(minY.toFixed(0), pad + 2, h - pad + 10);
+  })();
+</script>
+
+</body>
+</html>

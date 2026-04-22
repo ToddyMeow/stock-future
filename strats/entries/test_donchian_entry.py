@@ -129,7 +129,7 @@ def test_donchian_metadata():
 
 def test_donchian_with_engine_end_to_end():
     """Full StrategyEngine run with Donchian (HL) entry + HAB exit."""
-    from strats.engine import EngineConfig, StrategyEngine
+    from strats.engine import EngineConfig, StrategyEngine, StrategySlot
     from strats.exits.hab_exit import HABExitConfig, HABExitStrategy
 
     # Need enough bars for channel period + signal + entry + exit
@@ -156,8 +156,13 @@ def test_donchian_with_engine_end_to_end():
             portfolio_risk_cap=1.0, group_risk_cap={"default": 1.0},
             default_group_risk_cap=1.0, independent_group_soft_cap=1.0,
         ),
-        entry_strategy=DonchianEntryStrategy(DonchianEntryConfig(period=5)),
-        exit_strategy=HABExitStrategy(HABExitConfig(structure_fail_bars=15)),
+        strategies=[
+            StrategySlot(
+                "default",
+                DonchianEntryStrategy(DonchianEntryConfig(period=5)),
+                HABExitStrategy(HABExitConfig(structure_fail_bars=15)),
+            )
+        ],
     )
     result = engine.run(df)
 

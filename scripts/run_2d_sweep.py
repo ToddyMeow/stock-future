@@ -26,12 +26,11 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from scripts.report_baseline import derive_best_combos
-from scripts.run_three_layer_backtest import (
-    build_entries, build_exits, load_bars, make_engine_config,
-)
+from scripts.research.report_baseline import derive_best_combos
 from strats.engine import StrategyEngine, StrategySlot
+from strats.factory import build_engine_config, build_entries, build_exits
 from strats.helpers import PortfolioAnalyzer, deflated_sharpe
+from strats.research_support import load_hab_bars
 
 
 RISK_GRID = [0.005, 0.010, 0.015]
@@ -70,12 +69,19 @@ def main() -> None:
     parser.add_argument("--suffix", default="baseline")
     args = parser.parse_args()
 
-    file_suffix = f"_{args.suffix}" if args.suffix else ""
-    group_csv = ROOT / "data" / f"backtest_group_layer{file_suffix}.csv"
+    run_name = args.suffix or "default"
+    group_csv = ROOT / "data" / "runs" / run_name / "backtest_group_layer.csv"
     best_combos = derive_best_combos(group_csv)
     print(f"Best combos ({len(best_combos)} groups) loaded.\n")
 
-    bars = load_bars()
+    sens_dir = ROOT / "data" / "sensitivity"
+    sens_dir.mkdir(parents=True, exist_ok=True)
+    best_point_dir = ROOT / "data" / "runs" / "best_point"
+    best_point_dir.mkdir(parents=True, exist_ok=True)
+    best_2d_dir = ROOT / "data" / "runs" / "best_2d"
+    best_2d_dir.mkdir(parents=True, exist_ok=True)
+
+    bars = load_hab_bars()
     entries = build_entries()
     exits = build_exits()
 
@@ -83,7 +89,11 @@ def main() -> None:
     for r in RISK_GRID:
         for cap in CAP_GRID:
             t0 = time.time()
-            cfg = replace(make_engine_config(), risk_per_trade=r, portfolio_risk_cap=cap)
+            cfg = replace(
+                build_engine_config(profile="research"),
+                risk_per_trade=r,
+                portfolio_risk_cap=cap,
+            )
             try:
                 result = run_engine(bars, cfg, entries, exits, best_combos)
                 stats = PortfolioAnalyzer(result, cfg).summary_stats()
@@ -119,7 +129,7 @@ def main() -> None:
 
     # Save grid CSV (strip internal fields)
     df = pd.DataFrame([{k: v for k, v in row.items() if not k.startswith("_")} for row in rows])
-    out = ROOT / "data" / "sensitivity_2d_risk_x_cap.csv"
+    out = sens_dir / "sensitivity_2d_risk_x_cap.csv"
     df.to_csv(out, index=False)
     print(f"\nSaved grid: {out}")
 
@@ -155,7 +165,7 @@ def main() -> None:
 
     # Save equity curve for best point
     pdf_best = best_row["_portfolio_daily"]
-    eq_out = ROOT / "data" / "backtest_portfolio_layer_best2d.csv"
+    eq_out = best_2d_dir / "backtest_portfolio_layer.csv"
     if not pdf_best.empty:
         # Recompute drawdown cols for the plot script
         pdf_best = pdf_best.sort_values("date").reset_index(drop=True)
@@ -177,10 +187,9 @@ def main() -> None:
         "total_trades": int(best["trades"]),
         "dsr_by_n_trials": {str(k): v for k, v in dsr_results.items()},
     }
-    (ROOT / "data" / "best_point_summary.json").write_text(
-        json.dumps(summary, indent=2), encoding="utf-8"
-    )
-    print(f"Saved: data/best_point_summary.json")
+    bp_out = best_point_dir / "summary.json"
+    bp_out.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    print(f"Saved: {bp_out}")
 
 
 if __name__ == "__main__":

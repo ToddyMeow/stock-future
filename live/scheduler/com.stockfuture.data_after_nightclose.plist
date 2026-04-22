@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  com.stockfuture.data_after_nightclose — 每交易日 02:35 夜盘收盘后拉夜盘 bar
+
+  （夜盘 21:00-次日 02:30 收盘，02:35 给 5 分钟余量）
+
+  手动激活：
+    cp live/scheduler/com.stockfuture.data_after_nightclose.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.stockfuture.data_after_nightclose.plist
+  卸载：
+    launchctl unload ~/Library/LaunchAgents/com.stockfuture.data_after_nightclose.plist
+  立即手动触发一次：
+    launchctl start com.stockfuture.data_after_nightclose
+  日志：
+    tail -f /Users/mm/Trading/stock-future/live/logs/launchd/data_after_nightclose.{out,err}.log
+
+  注意：launchd 的 02:35 指"每天凌晨 2:35"，即日历意义的 T+1 日 02:35，
+  对应中国期货夜盘 T 日 21:00 - T+1 日 02:30 的收盘后。
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.stockfuture.data_after_nightclose</string>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/mm/Trading/stock-future</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>TZ</key>
+    <string>Asia/Shanghai</string>
+  </dict>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-lc</string>
+    <string>/Users/mm/opt/miniconda3/bin/python -m live.data_pipeline --mode rqdata --date $(date -v-1d +%Y-%m-%d)</string>
+  </array>
+
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>2</integer>
+    <key>Minute</key>
+    <integer>45</integer>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>/Users/mm/Trading/stock-future/live/logs/launchd/data_after_nightclose.out.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/Users/mm/Trading/stock-future/live/logs/launchd/data_after_nightclose.err.log</string>
+
+  <key>RunAtLoad</key>
+  <false/>
+</dict>
+</plist>

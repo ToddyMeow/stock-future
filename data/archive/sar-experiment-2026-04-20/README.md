@@ -61,8 +61,8 @@ sar-experiment-2026-04-20/
 - `scripts/run_phase5_oos.py` — 从 best_combos_stable 读 `reverse_on_stop` 做 per-slot 配置
 
 ### 新增脚本
-- `scripts/analyze_phase3_sar_diff.py` — baseline vs SAR 的 per-combo delta 报告
-- `scripts/analyze_phase3_mixed.py` — per-group pick winner 生成 mixed best_combos
+- `scripts/research/analyze_phase3_sar_diff.py` — baseline vs SAR 的 per-combo delta 报告
+- `scripts/research/analyze_phase3_mixed.py` — per-group pick winner 生成 mixed best_combos
 
 ### Plan 文件
 - `~/.claude/plans/portfolio-random-entry-random-exit-majestic-spark.md` — 原始计划与决策
@@ -83,17 +83,17 @@ python scripts/run_phase3_combo_selection.py \
     --output-tag risk3cap8_sar
 
 # Step 2: 分析与 diff 报告
-python scripts/analyze_phase3.py --tag risk3cap8_baseline
-python scripts/analyze_phase3.py --tag risk3cap8_sar
-python scripts/analyze_phase3_sar_diff.py \
+python scripts/research/analyze_phase3.py --tag risk3cap8_baseline
+python scripts/research/analyze_phase3.py --tag risk3cap8_sar
+python scripts/research/analyze_phase3_sar_diff.py \
     --baseline-tag risk3cap8_baseline --sar-tag risk3cap8_sar
 
 # Step 3: Phase4 rolling stability
-python scripts/analyze_phase4_rolling.py --tag risk3cap8_baseline
-python scripts/analyze_phase4_rolling.py --tag risk3cap8_sar
+python scripts/research/analyze_phase4_rolling.py --tag risk3cap8_baseline
+python scripts/research/analyze_phase4_rolling.py --tag risk3cap8_sar
 
 # Step 4: Mixed portfolio 选择（per-group pick winner）
-python scripts/analyze_phase3_mixed.py \
+python scripts/research/analyze_phase3_mixed.py \
     --baseline-tag risk3cap8_baseline --sar-tag risk3cap8_sar \
     --mixed-tag risk3cap8_mixed
 

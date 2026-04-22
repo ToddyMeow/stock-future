@@ -8,10 +8,10 @@ Combo matrix: 5 entries x 7 exits = 35
 Groups: 9 (equity_index, bond, chem_energy, rubber_fiber, metals,
             black_steel, agri, building, livestock)
 
-Output:
-    data/backtest_strategy_layer.csv   — group x combo x year
-    data/backtest_group_layer.csv      — group x year (best combo per group)
-    data/backtest_portfolio_layer.csv  — daily equity curve (all groups combined)
+Output (under data/runs/<suffix>/):
+    backtest_strategy_layer.csv   — group x combo x year
+    backtest_group_layer.csv      — group x year (best combo per group)
+    backtest_portfolio_layer.csv  — daily equity curve (all groups combined)
 """
 
 from __future__ import annotations
@@ -31,15 +31,27 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from strats.config_loader import load_config, build_engine_config
+from strats.config_loader import load_config
 from strats.engine import EngineConfig, StrategyEngine, StrategySlot
+from strats.factory import (
+    build_engine_config as shared_build_engine_config,
+    build_entries as shared_build_entries,
+    build_exits as shared_build_exits,
+)
 from strats.helpers import PortfolioAnalyzer, adx as compute_adx, wilder_atr
+from strats.research_support import (
+    filter_group_bars as shared_filter_group,
+    load_hab_bars as shared_load_hab_bars,
+    yearly_stats_from_trades as shared_yearly_stats_from_trades,
+)
 
 # ── Entries ──────────────────────────────────────────────────────────────
 from strats.entries.hl_entry import HLEntryConfig, HLEntryStrategy
 from strats.entries.boll_break_entry import BollBreakEntryConfig, BollBreakEntryStrategy
 from strats.entries.ama_entry import AmaEntryConfig, AmaEntryStrategy
 from strats.entries.double_ma_entry import DoubleMaEntryConfig, DoubleMaEntryStrategy
+from strats.entries.adaptive_hl_entry import AdaptiveHLEntryConfig, AdaptiveHLEntryStrategy
+from strats.entries.adaptive_boll_entry import AdaptiveBollEntryConfig, AdaptiveBollEntryStrategy
 # from strats.entries.adaptive_macd_entry import AdaptiveMacdEntryConfig, AdaptiveMacdEntryStrategy
 
 # ── Exits ────────────────────────────────────────────────────────────────
@@ -68,55 +80,39 @@ IND_GROUPS = [
 ALL_GROUPS = GROUPS + IND_GROUPS
 
 
-def build_entries() -> Dict[str, Any]:
-    """Return {entry_id: entry_strategy} with allow_short=True."""
-    return {
-        "hl_9": HLEntryStrategy(HLEntryConfig(period=9, allow_short=True)),
-        "hl_21": HLEntryStrategy(HLEntryConfig(period=21, allow_short=True)),
-        "boll": BollBreakEntryStrategy(BollBreakEntryConfig(period=22, k=2.0, allow_short=True)),
-        "ama": AmaEntryStrategy(AmaEntryConfig(n=10, fast_period=2, slow_period=30, allow_short=True)),
-        "double_ma": DoubleMaEntryStrategy(DoubleMaEntryConfig(fast=13, slow=34, allow_short=True)),
-    }
+def build_entries(include_adaptive: bool = False) -> Dict[str, Any]:
+    """Backward-compatible wrapper around the shared factory."""
+    return shared_build_entries(include_adaptive=include_adaptive, allow_short=True)
 
 
 def build_exits() -> Dict[str, Any]:
-    """Return {exit_id: exit_strategy}."""
-    return {
-        "hl": HLExitStrategy(HLExitConfig(period=21)),
-        "boll": BollExitStrategy(BollExitConfig(period=22, k=2.0)),
-        "ama": AmaExitStrategy(AmaExitConfig(n=10, fast_period=2, slow_period=30)),
-        "atr_trail": AtrTrailExitStrategy(AtrTrailExitConfig(atr_mult=4.5)),
-        "term": TermExitStrategy(TermExitConfig(min_bars=2, max_bars=13, min_target_r=1.0)),
-        "double_ma": DoubleMaExitStrategy(DoubleMaExitConfig(fast=13, slow=34)),
-    }
+    """Backward-compatible wrapper around the shared factory."""
+    return shared_build_exits()
 
 
-def make_engine_config(adx_off: bool = False, risk_overrides: dict = None) -> EngineConfig:
+def make_engine_config(
+    adx_off: bool = False,
+    risk_overrides: dict = None,
+    congestion_filter: bool = False,
+) -> EngineConfig:
     """Load base config from config.yaml, override allow_short=True."""
-    cfg = load_config()
-    base = build_engine_config(cfg)
-    overrides = {"allow_short": True}
-    if adx_off:
-        overrides["adx_floor"] = 1.0  # trend_score always 1.0 → ADX has no effect
-    if risk_overrides:
-        overrides.update(risk_overrides)
-    return replace(base, **overrides)
+    return shared_build_engine_config(
+        profile="research",
+        overrides=risk_overrides,
+        adx_off=adx_off,
+        congestion_filter=congestion_filter,
+        config=load_config(),
+    )
 
 
 def load_bars() -> pd.DataFrame:
-    """Load hab_bars.csv and clamp OHLC so engine validation passes."""
-    path = ROOT / "data" / "cache" / "normalized" / "hab_bars.csv"
-    bars = pd.read_csv(path)
-    bars["date"] = pd.to_datetime(bars["date"])
-    # Clamp: ensure high >= max(open,close), low <= min(open,close)
-    bars["high"] = bars[["high", "open", "close"]].max(axis=1)
-    bars["low"] = bars[["low", "open", "close"]].min(axis=1)
-    return bars
+    """Backward-compatible wrapper around the shared research helper."""
+    return shared_load_hab_bars()
 
 
 def filter_group(bars: pd.DataFrame, group: str) -> pd.DataFrame:
-    """Filter bars to symbols belonging to a specific group."""
-    return bars[bars["group_name"] == group].copy()
+    """Backward-compatible wrapper around the shared research helper."""
+    return shared_filter_group(bars, group)
 
 
 def yearly_stats_from_trades(
@@ -124,77 +120,8 @@ def yearly_stats_from_trades(
     portfolio_daily: pd.DataFrame,
     initial_capital: float,
 ) -> List[Dict[str, Any]]:
-    """Split trades by year and compute per-year metrics."""
-    if trades.empty:
-        return []
-
-    trades = trades.copy()
-    trades["year"] = pd.to_datetime(trades["entry_date"]).dt.year
-    years = sorted(trades["year"].unique())
-
-    # Also split equity curve by year
-    pdf = portfolio_daily.copy()
-    if not pdf.empty:
-        pdf["year"] = pd.to_datetime(pdf["date"]).dt.year
-
-    rows = []
-    for yr in years:
-        yr_trades = trades[trades["year"] == yr]
-        n = len(yr_trades)
-        if n == 0:
-            continue
-
-        wins = yr_trades[yr_trades["net_pnl"] > 0]
-        losses = yr_trades[yr_trades["net_pnl"] <= 0]
-        win_rate = len(wins) / n
-        pf = (
-            wins["net_pnl"].sum() / abs(losses["net_pnl"].sum())
-            if len(losses) > 0 and losses["net_pnl"].sum() != 0
-            else float("inf") if len(wins) > 0 else 0.0
-        )
-        avg_r = yr_trades["r_multiple"].mean()
-
-        # Sharpe from equity curve for this year
-        sharpe = 0.0
-        cagr = 0.0
-        max_dd = 0.0
-        if not pdf.empty:
-            yr_eq = pdf[pdf["year"] == yr]
-            if len(yr_eq) > 1:
-                daily_ret = yr_eq["equity"].pct_change().dropna()
-                if daily_ret.std() > 0:
-                    sharpe = daily_ret.mean() / daily_ret.std() * np.sqrt(252)
-                eq_start = yr_eq["equity"].iloc[0]
-                eq_end = yr_eq["equity"].iloc[-1]
-                days = (yr_eq["date"].iloc[-1] - yr_eq["date"].iloc[0]).days
-                if eq_start > 0 and days > 0:
-                    cagr = (eq_end / eq_start) ** (365.25 / max(days, 1)) - 1.0
-                peak = yr_eq["equity"].cummax()
-                dd = (yr_eq["equity"] - peak) / peak.where(peak > 0, np.nan)
-                max_dd = dd.min() if not dd.isna().all() else 0.0
-
-        # Direction breakdown
-        long_trades = len(yr_trades[yr_trades["direction"] == 1])
-        short_trades = len(yr_trades[yr_trades["direction"] == -1])
-
-        # Exit reason distribution
-        exit_reasons = yr_trades["exit_reason"].value_counts().to_dict()
-
-        rows.append({
-            "year": yr,
-            "trades": n,
-            "sharpe": round(sharpe, 3),
-            "cagr": round(cagr, 4),
-            "profit_factor": round(pf, 3) if pf != float("inf") else 999.0,
-            "win_rate": round(win_rate, 3),
-            "avg_r": round(avg_r, 3),
-            "max_dd_pct": round(max_dd, 4),
-            "long_trades": long_trades,
-            "short_trades": short_trades,
-            "net_pnl": round(yr_trades["net_pnl"].sum(), 2),
-            "exit_reasons": json.dumps(exit_reasons, ensure_ascii=False),
-        })
-    return rows
+    """Backward-compatible wrapper around the shared research helper."""
+    return shared_yearly_stats_from_trades(trades, portfolio_daily, initial_capital)
 
 
 def compute_avg_adx_by_year(bars: pd.DataFrame) -> Dict[int, float]:
@@ -565,10 +492,24 @@ def main():
     parser.add_argument("--risk-per-trade", type=float, default=None)
     parser.add_argument("--portfolio-risk-cap", type=float, default=None)
     parser.add_argument("--group-risk-cap", type=float, default=None, help="Uniform group risk cap")
+    parser.add_argument("--congestion-filter", action="store_true",
+                        help="Enable v5 CPI+ADX congestion gate")
+    parser.add_argument("--include-adaptive", action="store_true",
+                        help="Include v5 adaptive_hl/adaptive_boll entries (7 total)")
+    parser.add_argument("--profit-target-atr-r", type=float, default=0.0,
+                        help="v6 profit target: close at N×ATR unrealized R (0=off)")
+    parser.add_argument("--profit-target-close-fraction", type=float, default=1.0,
+                        help="v6 fraction of position to close at profit target (1.0=full, 0.5=half)")
+    parser.add_argument("--breakeven-trigger-atr-r", type=float, default=0.0,
+                        help="v7 breakeven ratchet: at N×ATR unrealized R, lift stop (0=off)")
+    parser.add_argument("--breakeven-stop-offset-atr", type=float, default=0.0,
+                        help="v7 offset when ratcheting: 0=breakeven, 1.0=entry+1×ATR")
     args = parser.parse_args()
 
     adx_off = args.adx_off
-    suffix = args.suffix or ("_no_adx" if adx_off else "")
+    suffix = args.suffix or ("no_adx" if adx_off else "default")
+    run_dir = ROOT / "data" / "runs" / suffix
+    run_dir.mkdir(parents=True, exist_ok=True)
     adx_label = "ADX OFF" if adx_off else "ADX ON"
 
     # Build risk overrides from CLI
@@ -580,6 +521,12 @@ def main():
     if args.group_risk_cap is not None:
         cap = args.group_risk_cap
         risk_overrides["group_risk_cap"] = {g: cap for g in GROUPS}
+    if args.profit_target_atr_r > 0.0:
+        risk_overrides["profit_target_atr_r"] = args.profit_target_atr_r
+        risk_overrides["profit_target_close_fraction"] = args.profit_target_close_fraction
+    if args.breakeven_trigger_atr_r > 0.0:
+        risk_overrides["breakeven_trigger_atr_r"] = args.breakeven_trigger_atr_r
+        risk_overrides["breakeven_stop_offset_atr"] = args.breakeven_stop_offset_atr
 
     t0 = time.time()
     print("=" * 60)
@@ -589,8 +536,12 @@ def main():
 
     # Setup
     bars = load_bars()
-    engine_cfg = make_engine_config(adx_off=adx_off, risk_overrides=risk_overrides or None)
-    entries = build_entries()
+    engine_cfg = make_engine_config(
+        adx_off=adx_off,
+        risk_overrides=risk_overrides or None,
+        congestion_filter=args.congestion_filter,
+    )
+    entries = build_entries(include_adaptive=args.include_adaptive)
     exits = build_exits()
 
     print(f"\nData: {len(bars)} rows, {bars['symbol'].nunique()} symbols")
@@ -606,7 +557,7 @@ def main():
     print(f"{'='*60}")
     layer1 = run_layer1(bars, engine_cfg, entries, exits)
 
-    out1 = ROOT / "data" / f"backtest_strategy_layer{suffix}.csv"
+    out1 = run_dir / "backtest_strategy_layer.csv"
     layer1.to_csv(out1, index=False)
     print(f"\n  -> Saved: {out1} ({len(layer1)} rows)")
 
@@ -616,7 +567,7 @@ def main():
     print(f"{'='*60}")
     layer2, best_combos = run_layer2(bars, engine_cfg, entries, exits, layer1)
 
-    out2 = ROOT / "data" / f"backtest_group_layer{suffix}.csv"
+    out2 = run_dir / "backtest_group_layer.csv"
     if not layer2.empty:
         layer2.to_csv(out2, index=False)
         print(f"\n  -> Saved: {out2} ({len(layer2)} rows)")
@@ -628,7 +579,7 @@ def main():
     print(f"{'='*60}")
     equity, portfolio_stats = run_layer3(bars, engine_cfg, entries, exits, best_combos)
 
-    out3 = ROOT / "data" / f"backtest_portfolio_layer{suffix}.csv"
+    out3 = run_dir / "backtest_portfolio_layer.csv"
     if not equity.empty:
         equity.to_csv(out3, index=False)
         print(f"\n  -> Saved: {out3} ({len(equity)} rows)")

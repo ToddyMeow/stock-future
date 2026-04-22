@@ -30,10 +30,9 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from strats.engine import StrategyEngine, StrategySlot
-from scripts.run_three_layer_backtest import (
-    build_entries, build_exits, load_bars, make_engine_config,
-)
+from strats.engine import StrategyEngine
+from strats.factory import build_engine_config, build_strategy_slots_from_combos
+from strats.research_support import load_hab_bars
 from scripts.run_phase3_combo_selection import CONFIRMED_SYMS, KEEP_TRADE_COLS
 
 PHASE3_DIR = ROOT / "data" / "runs" / "phase3"
@@ -163,10 +162,16 @@ def main():
     ap.add_argument("--universe", type=Path, default=None,
                     help="Optional path to tradeable_symbols.json — restricts "
                          "CONFIRMED_SYMS to its 'tradeable_symbols' intersection")
+    ap.add_argument("--output-tag", default=None,
+                    help="Override output filename suffix (defaults to --tag). "
+                         "Use when running the same stable_combos tag twice with "
+                         "different OOS ranges to avoid overwriting.")
     args = ap.parse_args()
 
     if args.group_cap is None:
         args.group_cap = 0.06 if args.tag == "risk3cap6" else 0.08
+
+    out_tag = args.output_tag if args.output_tag else args.tag
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -179,7 +184,7 @@ def main():
     for _, row in stable.iterrows():
         print(f"    {row['group']:15s} {row['best_combo']}")
 
-    bars = load_bars()
+    bars = load_hab_bars()
     # Filter to confirmed symbols AND stable groups
     stable_groups = set(stable["group"].tolist())
     confirmed = set(CONFIRMED_SYMS)
@@ -208,29 +213,13 @@ def main():
     }
     if args.initial_capital is not None:
         overrides["initial_capital"] = args.initial_capital
-    engine_cfg = make_engine_config(risk_overrides=overrides)
+    engine_cfg = build_engine_config(profile="research", overrides=overrides)
 
-    entries = build_entries(include_adaptive=False)
-    exits = build_exits()
-
-    slots = []
-    for _, row in stable.iterrows():
-        entry_id, exit_id = row["best_combo"].split("+")
-        # v10: honor per-slot SAR flag if the stable CSV carries one
-        # (mixed portfolios set `reverse_on_stop` per group).
-        kwargs = {}
-        if "reverse_on_stop" in row.index and pd.notna(row["reverse_on_stop"]):
-            kwargs["reverse_on_stop"] = bool(row["reverse_on_stop"])
-        if "reverse_stop_atr_mult" in row.index and pd.notna(row.get("reverse_stop_atr_mult")):
-            kwargs["reverse_stop_atr_mult"] = float(row["reverse_stop_atr_mult"])
-        if "reverse_chain_max" in row.index and pd.notna(row.get("reverse_chain_max")):
-            kwargs["reverse_chain_max"] = int(row["reverse_chain_max"])
-        slots.append(StrategySlot(
-            strategy_id=f"{row['group']}_{row['best_combo']}",
-            entry_strategy=entries[entry_id],
-            exit_strategy=exits[exit_id],
-            **kwargs,
-        ))
+    slots = build_strategy_slots_from_combos(
+        stable,
+        include_adaptive=False,
+        allow_short=True,
+    )
     sar_slots = sum(1 for s in slots if s.reverse_on_stop is True)
     print(f"  Slots: {len(slots)} ({sar_slots} with SAR on, "
           f"{len(slots) - sar_slots} without)")
@@ -253,19 +242,19 @@ def main():
     if not pg.empty:
         pd.set_option("display.width", 200)
         print(pg.to_string(index=False))
-        pg.to_csv(OUT_DIR / f"per_group_{args.tag}.csv", index=False)
+        pg.to_csv(OUT_DIR / f"per_group_{out_tag}.csv", index=False)
 
     # Per-symbol
     ps = per_symbol_breakdown(result.trades)
     if not ps.empty:
-        ps.to_csv(OUT_DIR / f"per_symbol_{args.tag}.csv", index=False)
+        ps.to_csv(OUT_DIR / f"per_symbol_{out_tag}.csv", index=False)
         print("\n===== Per-symbol PnL (top/bottom) =====")
         print(pd.concat([ps.head(5), ps.tail(3)]).to_string(index=False))
 
     # Reject reason distribution
     reject = reject_distribution(result.daily_status)
     if not reject.empty:
-        reject.to_csv(OUT_DIR / f"reject_distribution_{args.tag}.csv", index=False)
+        reject.to_csv(OUT_DIR / f"reject_distribution_{out_tag}.csv", index=False)
         print("\n===== Reject reason distribution =====")
         print(reject.to_string(index=False))
 
@@ -273,7 +262,7 @@ def main():
     if not result.trades.empty:
         trade_cols = [c for c in KEEP_TRADE_COLS if c in result.trades.columns]
         tsub = result.trades[trade_cols + ["group_name", "strategy_id"]].copy()
-        tsub.to_csv(OUT_DIR / f"trades_{args.tag}.csv", index=False)
+        tsub.to_csv(OUT_DIR / f"trades_{out_tag}.csv", index=False)
         print(f"\n[trades saved] {len(tsub)} rows")
 
     # Save equity curve
@@ -282,7 +271,7 @@ def main():
         eq["daily_return"] = eq["equity"].pct_change()
         peak = eq["equity"].cummax()
         eq["drawdown_pct"] = (eq["equity"] - peak) / peak.where(peak > 0, np.nan)
-        eq.to_csv(OUT_DIR / f"backtest_portfolio_layer_{args.tag}.csv", index=False)
+        eq.to_csv(OUT_DIR / f"backtest_portfolio_layer_{out_tag}.csv", index=False)
 
     # Save summary JSON
     summary = {
@@ -295,8 +284,8 @@ def main():
         "stable_groups": sorted(stable_groups),
         "metrics": metrics,
     }
-    (OUT_DIR / f"summary_{args.tag}.json").write_text(json.dumps(summary, indent=2))
-    print(f"\n[saved] {OUT_DIR}/summary_{args.tag}.json + portfolio / per_group / per_symbol / reject / trades")
+    (OUT_DIR / f"summary_{out_tag}.json").write_text(json.dumps(summary, indent=2))
+    print(f"\n[saved] {OUT_DIR}/summary_{out_tag}.json + portfolio / per_group / per_symbol / reject / trades")
 
 
 if __name__ == "__main__":

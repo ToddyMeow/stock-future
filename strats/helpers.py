@@ -44,7 +44,11 @@ def wilder_smooth(values: np.ndarray, period: int) -> np.ndarray:
     out = np.full(len(values), np.nan, dtype=float)
     if len(values) < period:
         return out
-    out[period - 1] = np.nanmean(values[:period])
+    seed = values[:period]
+    finite_seed = seed[np.isfinite(seed)]
+    if finite_seed.size == 0:
+        return out
+    out[period - 1] = finite_seed.mean()
     for i in range(period, len(values)):
         prev = out[i - 1]
         cur = values[i]
@@ -90,6 +94,58 @@ def adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 20) -> 
     # ADX = Wilder smooth of DX
     adx_values = wilder_smooth(dx, period)
     return pd.Series(adx_values, index=high.index)
+
+
+def choppiness_index(
+    high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14
+) -> pd.Series:
+    """Dreiss Choppiness Index (0–100).
+
+        CI = 100 × log10( Σ ATR(1) / (max(high, period) − min(low, period)) ) / log10(period)
+
+    Interpretation (classic thresholds):
+      > 61.8  — choppy / range-bound / congested
+      < 38.2  — trending
+      in between — neutral
+
+    The numerator sums 1-bar True Ranges, the denominator is the span of
+    the outer high-to-low over the same window. When price oscillates inside
+    a box the numerator >> denominator → high CI → congestion.
+
+    Uses natural-log equivalent via log10 for compatibility with literature.
+    Returns NaN for the first `period-1` bars.
+    """
+    h = high.to_numpy(dtype=float)
+    l = low.to_numpy(dtype=float)
+    c = close.to_numpy(dtype=float)
+    n = len(h)
+    if n == 0:
+        return pd.Series([], index=high.index, dtype=float)
+
+    prev_c = np.full(n, np.nan)
+    prev_c[1:] = c[:-1]
+    tr1 = np.maximum(
+        np.maximum(np.abs(h - l), np.abs(h - prev_c)),
+        np.abs(l - prev_c),
+    )
+    # For the first bar prev_c is NaN → use (high - low)
+    tr1[0] = h[0] - l[0]
+
+    out = np.full(n, np.nan)
+    if period < 2 or n < period:
+        return pd.Series(out, index=high.index)
+
+    log_p = np.log10(period)
+    for i in range(period - 1, n):
+        window_tr = tr1[i - period + 1 : i + 1]
+        window_h = h[i - period + 1 : i + 1]
+        window_l = l[i - period + 1 : i + 1]
+        span = window_h.max() - window_l.min()
+        if span <= 0 or np.isnan(window_tr).any():
+            continue
+        ci = 100.0 * np.log10(window_tr.sum() / span) / log_p
+        out[i] = ci
+    return pd.Series(out, index=high.index)
 
 
 def wilder_atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int) -> pd.Series:

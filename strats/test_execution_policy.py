@@ -16,7 +16,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from strats.engine import EngineConfig, StrategyEngine
+from strats.engine import EngineConfig, StrategyEngine, StrategySlot
 from strats.entries.hl_entry import HLEntryConfig, HLEntryStrategy
 from strats.exits.atr_trail_exit import AtrTrailExitConfig, AtrTrailExitStrategy
 
@@ -45,8 +45,13 @@ def test_prepared_next_trade_date_is_strictly_later_than_date() -> None:
     cfg = EngineConfig(atr_period=2, adx_period=2)
     engine = StrategyEngine(
         config=cfg,
-        entry_strategy=HLEntryStrategy(HLEntryConfig(period=3)),
-        exit_strategy=AtrTrailExitStrategy(AtrTrailExitConfig(atr_mult=3.0)),
+        strategies=[
+            StrategySlot(
+                "default",
+                HLEntryStrategy(HLEntryConfig(period=3)),
+                AtrTrailExitStrategy(AtrTrailExitConfig(atr_mult=3.0)),
+            )
+        ],
     )
     r = engine.run(bars)
     prep = r.prepared_data[["date", "next_trade_date"]].copy()
@@ -96,8 +101,13 @@ def test_no_same_bar_fill_in_real_backtest() -> None:
     )
     engine = StrategyEngine(
         config=cfg,
-        entry_strategy=HLEntryStrategy(HLEntryConfig(period=21, allow_short=True)),
-        exit_strategy=AtrTrailExitStrategy(AtrTrailExitConfig(atr_mult=3.0)),
+        strategies=[
+            StrategySlot(
+                "default",
+                HLEntryStrategy(HLEntryConfig(period=21, allow_short=True)),
+                AtrTrailExitStrategy(AtrTrailExitConfig(atr_mult=3.0)),
+            )
+        ],
     )
     r = engine.run(rb)
     if r.trades.empty:

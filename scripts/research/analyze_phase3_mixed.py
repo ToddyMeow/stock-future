@@ -12,7 +12,7 @@ Output:
     column (bool). Used by run_phase5_oos.py to configure per-slot SAR.
 
 Usage:
-  python scripts/analyze_phase3_mixed.py \\
+  python scripts/research/analyze_phase3_mixed.py \\
       --baseline-tag risk3cap8_baseline --sar-tag risk3cap8_sar \\
       --mixed-tag risk3cap8_mixed
 """
@@ -24,7 +24,7 @@ from pathlib import Path
 
 import pandas as pd
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 PHASE3_DIR = ROOT / "data" / "runs" / "phase3"

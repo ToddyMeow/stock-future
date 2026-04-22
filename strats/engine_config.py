@@ -158,6 +158,13 @@ class EngineConfig:
     # under the portfolio_risk_cap gate.
     slot_permutation_seed: Optional[int] = None
 
+    # 2026-04-22 新增：live 模式下填最后一 bar 的 next_trade_date。
+    # 回测有下一 bar，shift(-1) 够用；live 最后 bar = T-1 close，shift=NaN
+    # → engine 以 NO_NEXT_TRADE_DATE 拒任何 T-1 close 触发的信号。
+    # 塞 TradingCalendar 实例让 engine 用 calendar.next_trading_day() 填。
+    # None = 保持原 shift(-1) 行为。Any 类型避免循环 import。
+    trading_calendar: Any = None
+
     # v10: Stop-and-reverse (SAR). When reverse_on_stop is True, after any
     # position closes with an exit_reason in reverse_eligible_reasons, the
     # engine synthesizes a reverse PendingEntry (opposite direction) sized
@@ -191,6 +198,22 @@ class EngineConfig:
 
     # Symbol exclusion
     exclude_symbols: FrozenSet[str] = frozenset()
+
+    # Risk-definition refactor (2026-04-19): `portfolio_risk_cap` /
+    # `group_risk_cap` / `default_group_risk_cap` / `independent_group_soft_cap`
+    # are now evaluated on **principal_risk** (= max(entry_fill − stop, 0) ×
+    # mult × qty, direction-adjusted), i.e. the loss relative to entry when
+    # the stop is hit. Trailing past entry releases cap (risk = 0), rewarding
+    # winners.
+    #
+    # `unrealized_exposure_soft_cap` is a **log-only** (soft) cap on the
+    # legacy "floating P&L between current and stop" exposure:
+    #     unrealized_exposure = max(current − stop, 0) × mult × qty (long;
+    #     short reversed). When the sum across open positions exceeds
+    #     equity × this ratio, the engine emits a logging.warning and
+    #     records a diagnostic row — **nothing is rejected**.
+    # Default 0.40 is ~2× the hard principal cap (0.20) — tune to taste.
+    unrealized_exposure_soft_cap: float = 0.40
 
     eps: float = 1e-12
 

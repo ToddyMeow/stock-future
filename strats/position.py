@@ -69,6 +69,12 @@ class Position:
     consecutive_fail_count: int = 0
     original_qty: Optional[int] = None
     qty_shrink_reason: Optional[str] = None
+    # v6: Profit-target state. True once 5R target has been hit and a
+    # (partial or full) close was executed. Prevents re-triggering.
+    profit_target_triggered: bool = False
+    # v7: Breakeven-ratchet state. True once the breakeven trigger has fired
+    # and the stop has been ratcheted upward.
+    breakeven_triggered: bool = False
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     # Dual-stream segment accounting (populated only when EngineConfig.enable_dual_stream).

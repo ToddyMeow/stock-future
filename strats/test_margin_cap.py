@@ -8,7 +8,7 @@ from typing import Any, Dict
 import pandas as pd
 import pytest
 
-from strats.engine import EngineConfig, StrategyEngine
+from strats.engine import EngineConfig, StrategyEngine, StrategySlot
 
 
 # ---------- Unit tests on helpers ----------
@@ -34,8 +34,7 @@ def test_effective_margin_rate_no_schedule_returns_base_plus_broker() -> None:
     cfg = EngineConfig(broker_margin_addon=0.03)  # no tier
     eng = StrategyEngine(
         config=cfg,
-        entry_strategy=_DummyEntry(),
-        exit_strategy=_DummyExit(),
+        strategies=[StrategySlot("default", _DummyEntry(), _DummyExit())],
     )
     assert eng._effective_margin_rate(0.10, "RB2410", pd.Timestamp("2024-01-01")) == pytest.approx(0.13)
 
@@ -46,7 +45,10 @@ def test_effective_margin_rate_applies_tier_by_exact_month() -> None:
         broker_margin_addon=0.02,
         margin_tier_schedule={0: 0.10, 1: 0.05, 2: 0.02},
     )
-    eng = StrategyEngine(config=cfg, entry_strategy=_DummyEntry(), exit_strategy=_DummyExit())
+    eng = StrategyEngine(
+        config=cfg,
+        strategies=[StrategySlot("default", _DummyEntry(), _DummyExit())],
+    )
     # RB2410: delivers Oct 2024.
     assert eng._effective_margin_rate(0.10, "RB2410", pd.Timestamp("2024-10-15")) == pytest.approx(0.22)  # 0 months
     assert eng._effective_margin_rate(0.10, "RB2410", pd.Timestamp("2024-09-01")) == pytest.approx(0.17)  # 1 month
@@ -119,8 +121,7 @@ def test_margin_cap_rejects_signal_over_threshold() -> None:
     sig_date = bars["date"].iloc[4]
     engine = StrategyEngine(
         config=cfg,
-        entry_strategy=_DummyEntry(_EntryCfg(sig_date)),
-        exit_strategy=_DummyExit(),
+        strategies=[StrategySlot("default", _DummyEntry(_EntryCfg(sig_date)), _DummyExit())],
     )
     r = engine.run(bars)
     rej = r.daily_status.loc[r.daily_status["date"] == sig_date, "risk_reject_reason"]
@@ -144,8 +145,7 @@ def test_margin_cap_zero_disables_check() -> None:
     sig_date = bars["date"].iloc[4]
     engine = StrategyEngine(
         config=cfg,
-        entry_strategy=_DummyEntry(_EntryCfg(sig_date)),
-        exit_strategy=_DummyExit(),
+        strategies=[StrategySlot("default", _DummyEntry(_EntryCfg(sig_date)), _DummyExit())],
     )
     r = engine.run(bars)
     rej = r.daily_status.loc[r.daily_status["date"] == sig_date, "risk_reject_reason"].iloc[0]

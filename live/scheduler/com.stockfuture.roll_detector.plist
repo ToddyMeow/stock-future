@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  com.stockfuture.roll_detector — 每交易日 14:30 主力合约切换检测（Q6）
+
+  职责：
+    扫 positions 表，任何持仓的 contract_code 不等于 bars 表相同 symbol
+    最新一日 order_book_id → 通过 alert_escalate 发 warn 级告警触发
+    Server 酱微信推送。带 24h 去重，同一品种每天最多推一次。
+
+  时点：
+    14:30 = 日盘收盘前 30 分钟，给用户时间"平旧开新"。
+    --skip-non-trading：非交易日直接退出（节假日不打扰）。
+
+  手动激活：
+    cp live/scheduler/com.stockfuture.roll_detector.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.stockfuture.roll_detector.plist
+  卸载：
+    launchctl unload ~/Library/LaunchAgents/com.stockfuture.roll_detector.plist
+  立即手动触发一次：
+    launchctl start com.stockfuture.roll_detector
+  日志：
+    tail -f /Users/mm/Trading/stock-future/live/logs/launchd/roll_detector.{out,err}.log
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.stockfuture.roll_detector</string>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/mm/Trading/stock-future</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>TZ</key>
+    <string>Asia/Shanghai</string>
+  </dict>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-lc</string>
+    <string>/Users/mm/opt/miniconda3/bin/python -m live.roll_detector --skip-non-trading</string>
+  </array>
+
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>14</integer>
+    <key>Minute</key>
+    <integer>30</integer>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>/Users/mm/Trading/stock-future/live/logs/launchd/roll_detector.out.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/Users/mm/Trading/stock-future/live/logs/launchd/roll_detector.err.log</string>
+
+  <key>RunAtLoad</key>
+  <false/>
+</dict>
+</plist>

@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>TZ</key>
+		<string>Asia/Shanghai</string>
+	</dict>
+	<key>Label</key>
+	<string>com.stockfuture.data_after_dayclose</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>-lc</string>
+		<string>/Users/mm/opt/miniconda3/bin/python -m live.data_pipeline --mode rqdata --date $(date +%Y-%m-%d)</string>
+	</array>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>StandardErrorPath</key>
+	<string>/Users/mm/Trading/stock-future/live/logs/launchd/data_after_dayclose.err.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/mm/Trading/stock-future/live/logs/launchd/data_after_dayclose.out.log</string>
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Hour</key>
+		<integer>16</integer>
+		<key>Minute</key>
+		<integer>30</integer>
+	</dict>
+	<key>WorkingDirectory</key>
+	<string>/Users/mm/Trading/stock-future</string>
+</dict>
+</plist>

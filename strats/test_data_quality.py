@@ -9,7 +9,7 @@ from typing import Any, Dict
 import pandas as pd
 import pytest
 
-from strats.engine import EngineConfig, StrategyEngine
+from strats.engine import EngineConfig, StrategyEngine, StrategySlot
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -72,8 +72,13 @@ def _run_with(bars, *, entry_date: str, min_atr_pct: float):
     )
     engine = StrategyEngine(
         config=cfg,
-        entry_strategy=_ScriptedEntry(_ScriptedEntryConfig(pd.Timestamp(entry_date))),
-        exit_strategy=_NoopExit(),
+        strategies=[
+            StrategySlot(
+                "default",
+                _ScriptedEntry(_ScriptedEntryConfig(pd.Timestamp(entry_date))),
+                _NoopExit(),
+            )
+        ],
     )
     return engine.run(bars)
 
@@ -147,8 +152,13 @@ def test_dq_report_computes_expected_stats() -> None:
     # before running the full backtest.
     engine = StrategyEngine(
         config=EngineConfig(),
-        entry_strategy=_ScriptedEntry(_ScriptedEntryConfig(pd.Timestamp("2099-01-01"))),
-        exit_strategy=_NoopExit(),
+        strategies=[
+            StrategySlot(
+                "default",
+                _ScriptedEntry(_ScriptedEntryConfig(pd.Timestamp("2099-01-01"))),
+                _NoopExit(),
+            )
+        ],
     )
     rep = engine._compute_data_quality_report(bars)
     assert set(rep.columns) == {
@@ -191,8 +201,13 @@ def test_dq_report_on_real_bars() -> None:
     cfg = EngineConfig(min_atr_pct=0.0025)
     engine = StrategyEngine(
         config=cfg,
-        entry_strategy=HLEntryStrategy(HLEntryConfig(period=21)),
-        exit_strategy=AtrTrailExitStrategy(AtrTrailExitConfig(atr_mult=3.0)),
+        strategies=[
+            StrategySlot(
+                "default",
+                HLEntryStrategy(HLEntryConfig(period=21)),
+                AtrTrailExitStrategy(AtrTrailExitConfig(atr_mult=3.0)),
+            )
+        ],
     )
     r = engine.run(rb)
     rep = r.data_quality_report

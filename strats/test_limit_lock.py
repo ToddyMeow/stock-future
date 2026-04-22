@@ -8,7 +8,7 @@ from typing import Any, Dict
 import pandas as pd
 import pytest
 
-from strats.engine import EngineConfig, StrategyEngine
+from strats.engine import EngineConfig, StrategyEngine, StrategySlot
 
 
 @dataclass(frozen=True)
@@ -67,8 +67,13 @@ def _engine(entry_date: str, *, max_limit_days: int = 0, direction: int = 1):
     )
     return StrategyEngine(
         config=cfg,
-        entry_strategy=_ScriptedEntry(_ScriptedEntryConfig(pd.Timestamp(entry_date), direction)),
-        exit_strategy=_NoopExit(),
+        strategies=[
+            StrategySlot(
+                "default",
+                _ScriptedEntry(_ScriptedEntryConfig(pd.Timestamp(entry_date), direction)),
+                _NoopExit(),
+            )
+        ],
     )
 
 
@@ -77,11 +82,16 @@ def _engine(entry_date: str, *, max_limit_days: int = 0, direction: int = 1):
 
 def test_cannot_fill_side_locked_down_blocks_sell() -> None:
     # Unit test on the helper directly: locked-DOWN bar blocks SELL (side=-1).
-    from strats.engine import StrategyEngine, EngineConfig
+    from strats.engine import EngineConfig, StrategyEngine, StrategySlot
     eng = StrategyEngine(
         config=EngineConfig(),
-        entry_strategy=_ScriptedEntry(_ScriptedEntryConfig(pd.Timestamp("2024-01-01"))),
-        exit_strategy=_NoopExit(),
+        strategies=[
+            StrategySlot(
+                "default",
+                _ScriptedEntry(_ScriptedEntryConfig(pd.Timestamp("2024-01-01"))),
+                _NoopExit(),
+            )
+        ],
     )
     # Locked-down: H=L=close=90, limit_down=90.
     row_locked = pd.Series({

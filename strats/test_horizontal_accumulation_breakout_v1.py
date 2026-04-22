@@ -6,7 +6,7 @@ from dataclasses import fields
 import pandas as pd
 import pytest
 
-from strats.engine import EngineConfig, StrategyEngine
+from strats.engine import EngineConfig, StrategyEngine, StrategySlot
 from strats.entries.hab_entry import HABEntryConfig, HABEntryStrategy
 from strats.exits.hab_exit import HABExitConfig, HABExitStrategy
 from strats.helpers import PortfolioAnalyzer, detect_hlh_pattern, detect_lhl_pattern
@@ -55,8 +55,13 @@ def make_test_engine(**overrides) -> StrategyEngine:
 
     return StrategyEngine(
         config=engine_cfg,
-        entry_strategy=HABEntryStrategy(entry_cfg),
-        exit_strategy=HABExitStrategy(exit_cfg),
+        strategies=[
+            StrategySlot(
+                "default",
+                HABEntryStrategy(entry_cfg),
+                HABExitStrategy(exit_cfg),
+            )
+        ],
     )
 
 

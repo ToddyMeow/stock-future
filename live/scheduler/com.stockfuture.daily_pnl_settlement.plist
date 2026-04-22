@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>TZ</key>
+		<string>Asia/Shanghai</string>
+	</dict>
+	<key>Label</key>
+	<string>com.stockfuture.daily_pnl_settlement</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>-lc</string>
+		<string>/Users/mm/opt/miniconda3/bin/python -m live.daily_pnl_settlement</string>
+	</array>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>StandardErrorPath</key>
+	<string>/Users/mm/Trading/stock-future/live/logs/launchd/daily_pnl_settlement.err.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/mm/Trading/stock-future/live/logs/launchd/daily_pnl_settlement.out.log</string>
+	<key>StartCalendarInterval</key>
+	<array>
+		<dict>
+			<key>Hour</key>
+			<integer>17</integer>
+			<key>Minute</key>
+			<integer>5</integer>
+		</dict>
+		<dict>
+			<key>Hour</key>
+			<integer>2</integer>
+			<key>Minute</key>
+			<integer>53</integer>
+		</dict>
+	</array>
+	<key>WorkingDirectory</key>
+	<string>/Users/mm/Trading/stock-future</string>
+</dict>
+</plist>

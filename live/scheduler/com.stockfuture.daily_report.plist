@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  com.stockfuture.daily_report — 每日 18:00 生成日报并推送 Server 酱
+
+  手动激活：
+    cp live/scheduler/com.stockfuture.daily_report.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.stockfuture.daily_report.plist
+  卸载：
+    launchctl unload ~/Library/LaunchAgents/com.stockfuture.daily_report.plist
+  立即手动触发一次：
+    launchctl start com.stockfuture.daily_report
+  日志：
+    tail -f /Users/mm/Trading/stock-future/live/logs/launchd/daily_report.{out,err}.log
+
+  产物：
+    live/reports/YYYY-MM-DD.html（本地浏览器看）
+    Server 酱微信摘要 + 链接（若 SERVERCHAN_SEND_KEY 未配置则 stub 打日志）
+
+  周末 / 节假日：仍然会跑；report_service 查不到 instructions 时渲染空页。
+  不想周末跑：在 Calendar 加 Weekday key 限制 1-5（周一到周五）。
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.stockfuture.daily_report</string>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/mm/Trading/stock-future</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>TZ</key>
+    <string>Asia/Shanghai</string>
+  </dict>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-lc</string>
+    <string>/Users/mm/opt/miniconda3/bin/python -m live.report_service --date $(date +%Y-%m-%d)</string>
+  </array>
+
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>18</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>/Users/mm/Trading/stock-future/live/logs/launchd/daily_report.out.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/Users/mm/Trading/stock-future/live/logs/launchd/daily_report.err.log</string>
+
+  <key>RunAtLoad</key>
+  <false/>
+</dict>
+</plist>

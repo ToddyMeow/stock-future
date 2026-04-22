@@ -11,8 +11,8 @@ grid to build a (T, N) returns matrix, then call `pbo_cscv`. Skippable
 with --skip-pbo for a fast DSR-only run.
 
 Usage:
-    python scripts/diagnose_overfitting.py --suffix baseline --skip-pbo   # ~5s
-    python scripts/diagnose_overfitting.py --suffix baseline              # ~15-25 min
+    python scripts/research/diagnose_overfitting.py --suffix baseline --skip-pbo   # ~5s
+    python scripts/research/diagnose_overfitting.py --suffix baseline              # ~15-25 min
 """
 from __future__ import annotations
 
@@ -24,14 +24,17 @@ from pathlib import Path
 
 import pandas as pd
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from scripts.run_three_layer_backtest import (
-    GROUPS, build_entries, build_exits, filter_group, load_bars, make_engine_config,
-)
 from strats.engine import StrategyEngine, StrategySlot
+from strats.factory import build_engine_config, build_entries, build_exits
 from strats.helpers import deflated_sharpe, pbo_cscv
+from strats.research_support import (
+    GROUPS,
+    filter_group_bars as filter_group,
+    load_hab_bars,
+)
 
 
 def compute_dsr(portfolio_csv: Path, n_trials: int) -> float:
@@ -114,8 +117,9 @@ def main() -> None:
                         help="Mirror --adx-off of the baseline run when reconstructing.")
     args = parser.parse_args()
 
-    file_suffix = f"_{args.suffix}" if args.suffix else ""
-    portfolio_csv = ROOT / "data" / f"backtest_portfolio_layer{file_suffix}.csv"
+    run_name = args.suffix or "default"
+    run_dir = ROOT / "data" / "runs" / run_name
+    portfolio_csv = run_dir / "backtest_portfolio_layer.csv"
     if not portfolio_csv.exists():
         print(f"ERROR: {portfolio_csv} not found — run baseline first", file=sys.stderr)
         sys.exit(1)
@@ -139,8 +143,8 @@ def main() -> None:
         print("=" * 60)
         print(f"PBO — rerunning {args.n_trials} combos for daily returns")
         print("=" * 60)
-        bars = load_bars()
-        engine_cfg = make_engine_config(adx_off=args.adx_off)
+        bars = load_hab_bars()
+        engine_cfg = build_engine_config(profile="research", adx_off=args.adx_off)
         entries = build_entries()
         exits = build_exits()
         t0 = time.time()
@@ -149,7 +153,7 @@ def main() -> None:
             print("  No valid returns — aborting PBO.")
             pbo_val = float("nan")
         else:
-            mat_out = ROOT / "data" / f"combo_returns_matrix{file_suffix}.csv"
+            mat_out = run_dir / "combo_returns_matrix.csv"
             matrix.to_csv(mat_out)
             print(f"  Saved returns matrix: {mat_out}  shape={matrix.shape}")
             pbo_val = pbo_cscv(matrix, n_splits=args.n_splits)
@@ -163,7 +167,7 @@ def main() -> None:
             "n_variants": int(matrix.shape[1]) if not matrix.empty else 0,
         })
 
-    out = ROOT / "data" / f"overfitting_diagnostics{file_suffix}.json"
+    out = run_dir / "overfitting_diagnostics.json"
     out.write_text(json.dumps(results, indent=2), encoding="utf-8")
     print(f"\nSaved: {out}")
 

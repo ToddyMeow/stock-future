@@ -35,14 +35,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from strats.engine import StrategyEngine, StrategySlot
-
-from scripts.run_three_layer_backtest import (
-    build_entries,
-    build_exits,
-    load_bars,
-    make_engine_config,
-    yearly_stats_from_trades,
-)
+from strats.factory import build_engine_config, build_entries, build_exits
+from strats.research_support import load_hab_bars, yearly_stats_from_trades
 
 OUT_DIR = ROOT / "data" / "runs" / "phase3"
 
@@ -184,6 +178,10 @@ def main():
                     help="Comma-separated groups (default: all 13 ACTIVE_GROUPS)")
     ap.add_argument("--output-tag", default="default",
                     help="Output filename suffix (e.g. 'risk3cap6')")
+    ap.add_argument("--confirmed-syms-json", default=None,
+                    help="JSON file with keys 'symbols' (list) and 'groups' (list) "
+                         "to override CONFIRMED_SYMS / ACTIVE_GROUPS. Typically produced "
+                         "from Phase 2 tradeability scoring.")
     # v10: Stop-and-reverse (SAR)
     ap.add_argument("--reverse-on-stop", action="store_true",
                     help="Enable stop-and-reverse: after any stop-out exit, "
@@ -198,7 +196,19 @@ def main():
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     tag = args.output_tag
 
-    groups = [g.strip() for g in args.groups.split(",")] if args.groups else list(ACTIVE_GROUPS)
+    if args.confirmed_syms_json:
+        import json as _json
+        with open(args.confirmed_syms_json) as _f:
+            _override = _json.load(_f)
+        confirmed_syms = list(_override["symbols"])
+        active_groups = list(_override["groups"])
+        print(f"  confirmed_syms override from {args.confirmed_syms_json}: "
+              f"{len(confirmed_syms)} syms, {len(active_groups)} groups")
+    else:
+        confirmed_syms = list(CONFIRMED_SYMS)
+        active_groups = list(ACTIVE_GROUPS)
+
+    groups = [g.strip() for g in args.groups.split(",")] if args.groups else list(active_groups)
     print(f"=== Phase 3 combo selection: tag={tag} ===")
     print(f"  risk_per_trade = {args.risk_per_trade}")
     print(f"  group_cap      = {args.group_cap}")
@@ -207,8 +217,8 @@ def main():
     print(f"  groups         = {groups}")
 
     # Bars: filter to confirmed syms + IS date range
-    bars = load_bars()
-    bars = bars[bars["symbol"].isin(CONFIRMED_SYMS)].copy()
+    bars = load_hab_bars()
+    bars = bars[bars["symbol"].isin(confirmed_syms)].copy()
     is_end = pd.to_datetime(args.is_end)
     is_start = pd.to_datetime(args.is_start)
     bars = bars[(bars["date"] >= is_start) & (bars["date"] <= is_end)].copy()
@@ -218,7 +228,7 @@ def main():
     risk_overrides = {
         "risk_per_trade": args.risk_per_trade,
         "portfolio_risk_cap": args.portfolio_cap,
-        "group_risk_cap": {g: args.group_cap for g in ACTIVE_GROUPS},
+        "group_risk_cap": {g: args.group_cap for g in active_groups},
         "default_group_risk_cap": args.group_cap,
     }
     if args.initial_capital is not None:
@@ -229,7 +239,7 @@ def main():
         risk_overrides["reverse_stop_atr_mult"] = args.reverse_stop_atr_mult
         risk_overrides["reverse_chain_max"] = args.reverse_chain_max
         print(f"  SAR enabled    = ATR×{args.reverse_stop_atr_mult}, chain_max={args.reverse_chain_max}")
-    engine_cfg = make_engine_config(risk_overrides=risk_overrides)
+    engine_cfg = build_engine_config(profile="research", overrides=risk_overrides)
     print(f"  engine.group_risk_cap (sample) = "
           f"{list(engine_cfg.group_risk_cap.items())[:3]}")
 

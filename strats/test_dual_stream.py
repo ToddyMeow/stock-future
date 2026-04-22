@@ -17,7 +17,7 @@ from typing import Any, Dict
 import pandas as pd
 import pytest
 
-from strats.engine import EngineConfig, StrategyEngine
+from strats.engine import EngineConfig, StrategyEngine, StrategySlot
 
 
 # ---------- Minimal test strategies (always enter long day 1, exit day N) ----------
@@ -121,7 +121,10 @@ def _make_engine(enable_dual_stream: bool, entry_date: str, exit_date: str) -> S
     )
     entry = _ScriptedEntryStrategy(_ScriptedEntryConfig(pd.Timestamp(entry_date)))
     exit_ = _ScriptedExitStrategy(_ScriptedExitConfig(pd.Timestamp(exit_date)))
-    return StrategyEngine(config=cfg, entry_strategy=entry, exit_strategy=exit_)
+    return StrategyEngine(
+        config=cfg,
+        strategies=[StrategySlot("default", entry, exit_)],
+    )
 
 
 # ---------- Tests ----------

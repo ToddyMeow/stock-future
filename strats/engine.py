@@ -3,8 +3,13 @@
 Usage:
     engine = StrategyEngine(
         config=EngineConfig(...),
-        entry_strategy=HABEntryStrategy(HABEntryConfig(...)),
-        exit_strategy=HABExitStrategy(HABExitConfig(...)),
+        strategies=[
+            StrategySlot(
+                "default",
+                HABEntryStrategy(HABEntryConfig(...)),
+                HABExitStrategy(HABExitConfig(...)),
+            )
+        ],
     )
     result = engine.run(bars)
 """
@@ -12,6 +17,7 @@ Usage:
 from __future__ import annotations
 
 import json
+import logging
 import math
 from dataclasses import dataclass, field
 from datetime import date as _date_type
@@ -19,6 +25,8 @@ from typing import Any, Dict, FrozenSet, List, Literal, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 from strats.engine_config import EngineConfig, StrategySlot
 from strats.helpers import (
@@ -64,19 +72,12 @@ class StrategyEngine:
     def __init__(
         self,
         config: EngineConfig,
-        strategies: Optional[List[StrategySlot]] = None,
-        # Backward compat: single entry/exit
-        entry_strategy: Any = None,
-        exit_strategy: Any = None,
+        strategies: List[StrategySlot],
     ) -> None:
         self.config = config
-        # If old-style single strategy, wrap in StrategySlot
-        if strategies is not None:
-            self._strategies = strategies
-        elif entry_strategy is not None and exit_strategy is not None:
-            self._strategies = [StrategySlot("default", entry_strategy, exit_strategy)]
-        else:
-            raise ValueError("Provide either 'strategies' list or 'entry_strategy'+'exit_strategy'")
+        if not strategies:
+            raise ValueError("'strategies' must contain at least one StrategySlot")
+        self._strategies = strategies
         self._strategy_map: Dict[str, StrategySlot] = {s.strategy_id: s for s in self._strategies}
         # Backward-compat aliases (first strategy)
         self._entry_strategy = self._strategies[0].entry_strategy
@@ -637,6 +638,38 @@ class StrategyEngine:
                 last_close_by_symbol=last_close_by_symbol,
             )
 
+            # 5b) Soft cap — legacy "floating P&L between mark and stop"
+            # (definition C). This does NOT reject anything; it logs a
+            # warning when the sum across open positions exceeds
+            # equity × unrealized_exposure_soft_cap so traders can notice
+            # that a winning position chain has stretched stops very far
+            # from the current mark. `open_risk_total` above is the hard
+            # principal-risk aggregate.
+            unrealized_exposure_total, _ = self._compute_unrealized_exposure(
+                positions=positions,
+                close_map=close_map,
+                last_close_by_symbol=last_close_by_symbol,
+            )
+            soft_cap_ratio = cfg.unrealized_exposure_soft_cap
+            soft_cap_triggered = False
+            if (
+                soft_cap_ratio > 0.0
+                and equity_close > cfg.eps
+                and unrealized_exposure_total > equity_close * soft_cap_ratio
+            ):
+                soft_cap_triggered = True
+                logger.warning(
+                    "unrealized_exposure_soft_cap breach date=%s "
+                    "exposure=%.0f equity=%.0f ratio=%.3f threshold=%.3f "
+                    "positions=%d",
+                    pd.Timestamp(date).date() if hasattr(date, "to_pydatetime") else date,
+                    unrealized_exposure_total,
+                    equity_close,
+                    unrealized_exposure_total / equity_close,
+                    soft_cap_ratio,
+                    len(positions),
+                )
+
             # 6) Signal generation / next-open pending entries.
             # Initialize risk_reject for all strategies x symbols
             for slot in self._strategies:
@@ -690,14 +723,28 @@ class StrategyEngine:
                     for _, row in slot_day.iterrows()
                     if bool(row["entry_trigger_pass"])
                 ]
-                candidate_rows.sort(
-                    key=lambda row: (
-                        pd.Timestamp.max
-                        if pd.isna(row["next_trade_date"])
-                        else pd.Timestamp(row["next_trade_date"]),
-                        str(row[cfg.symbol_col]),
-                    )
-                )
+                # 2026-04-22 修 reject 字母序先到先得 bug（见 docs/audit_2026_04_22.md）
+                # 原 sort by (next_trade_date, symbol 字母序)，导致字母靠前的
+                # symbol 永远先占 portfolio_cap / group_cap，字母靠后的同 bar
+                # 一致被 reject（结构性不公平）。
+                #
+                # 方案演进：
+                #   v1 (放弃): per-bar 随机 shuffle — 25 万档 cap binding 频繁时，
+                #              每 bar 随机顺序带来成交序列噪声，Sharpe 从 2.03 → 0.32。
+                #   v2 (当前): 按 per_contract_risk 升序（proxy: atr_ref × multiplier）。
+                #              小仓先占 cap → 多样化保留；大仓后到若撞 cap 就让位给下一个。
+                #              deterministic、无字母 bias、无随机噪声。字母序作 tiebreaker。
+                def _candidate_sort_key(row):
+                    nd = row["next_trade_date"]
+                    nd_ts = pd.Timestamp.max if pd.isna(nd) else pd.Timestamp(nd)
+                    atr_v = row.get("atr_ref")
+                    mult_v = row.get(cfg.multiplier_col)
+                    try:
+                        risk_proxy = float(atr_v) * float(mult_v)
+                    except (TypeError, ValueError):
+                        risk_proxy = 0.0
+                    return (nd_ts, risk_proxy, str(row[cfg.symbol_col]))
+                candidate_rows.sort(key=_candidate_sort_key)
 
                 for row in candidate_rows:
                     symbol = str(row[cfg.symbol_col])
@@ -782,10 +829,12 @@ class StrategyEngine:
                             if not np.isfinite(per_contract_risk_est) or per_contract_risk_est <= 0.0:
                                 reason = "NON_POSITIVE_RISK"
                             else:
-                                # ADX trend filter: scale risk by group trend strength
-                                adx_val = float(row["adx"]) if pd.notna(row.get("adx")) else cfg.adx_scale
-                                trend_score = max(min(adx_val / cfg.adx_scale, 1.0), cfg.adx_floor)
-                                effective_risk = cfg.risk_per_trade * trend_score
+                                # 2026-04-22 去掉 ADX trend_score 缩放（见 docs/audit_2026_04_22.md）
+                                # 原 `effective_risk = risk_per_trade × trend_score(ADX)` 时序反利弗莫尔：
+                                # ADX 滞后 → 趋势初期 ADX 低 → 仓轻；趋势末期 ADX 高 → 仓重。
+                                # 现在恢复简单：每笔 entry 都用满 risk_per_trade。
+                                # 趋势筛选由 use_congestion_filter（CPI + ADX 硬拒）承担。
+                                effective_risk = cfg.risk_per_trade
                                 risk_budget_single = equity_close * effective_risk
                                 qty = math.floor(risk_budget_single / per_contract_risk_est)
                                 if qty < 1:
@@ -897,6 +946,9 @@ class StrategyEngine:
                     "accepted_signal_risk_today": accepted_today_risk_total,
                     "total_notional": total_notional,
                     "leverage": leverage,
+                    # Soft-cap diagnostics — logged only, no gate effect.
+                    "unrealized_exposure": unrealized_exposure_total,
+                    "unrealized_exposure_soft_cap_triggered": soft_cap_triggered,
                 }
             )
 
@@ -1101,6 +1153,19 @@ class StrategyEngine:
         # unconditionally; the gate itself is disabled by default.
         out["cpi"] = _choppiness_index(high=high, low=low, close=close, period=cfg.cpi_period)
         out["next_trade_date"] = out[cfg.date_col].shift(-1)
+        # 2026-04-22 bugfix：最后一行 shift(-1)=NaN，若 cfg.trading_calendar 提供，
+        # 用 calendar.next_trading_day() 填，让 live 模式下最后一 bar 触发的信号
+        # 能拿到合法 next_trade_date，不再被 NO_NEXT_TRADE_DATE 错误拒绝。
+        if cfg.trading_calendar is not None and len(out) > 0:
+            last_idx = out.index[-1]
+            if pd.isna(out.at[last_idx, "next_trade_date"]):
+                last_d = out.at[last_idx, cfg.date_col]
+                if pd.notna(last_d):
+                    try:
+                        nxt = cfg.trading_calendar.next_trading_day(pd.Timestamp(last_d).date())
+                        out.at[last_idx, "next_trade_date"] = pd.Timestamp(nxt)
+                    except Exception:  # noqa: BLE001
+                        pass  # calendar 查询失败就保留 NaN，fallback 到原逻辑
         # Per-symbol bar index (0-based), used by the warmup gate (1.7).
         out["_bar_index"] = np.arange(len(out), dtype=int)
         return out
@@ -2019,14 +2084,39 @@ class StrategyEngine:
         close_map: Dict[str, float],
         last_close_by_symbol: Dict[str, float],
     ) -> Tuple[float, Dict[str, float]]:
+        """Principal-risk aggregate (definition B, 2026-04-19).
+
+        For each open position, computes the loss relative to entry if the
+        stop were hit now:
+
+            long  : max(entry_fill − active_stop, 0) × mult × qty
+            short : max(active_stop − entry_fill, 0) × mult × qty
+
+        Behaviour vs the legacy definition C:
+          - Fresh position (stop below entry for long): risk ≈ initial risk.
+          - Stop ratcheted past entry (trail into profit): risk = 0 →
+            releases portfolio/group cap so winners don't keep hogging it.
+          - Degenerate slippage case where entry ≤ stop (long): clamped to 0.
+
+        `close_map` / `last_close_by_symbol` are kept in the signature for
+        backward compatibility with call sites; principal risk does not
+        actually need the mark price.
+        """
+        del close_map  # principal risk is mark-price independent
+        del last_close_by_symbol
         open_risk_total = 0.0
         by_group: Dict[str, float] = {}
         for position in positions.values():
-            symbol = position.symbol
-            current_price = close_map.get(symbol, last_close_by_symbol.get(symbol, position.entry_fill))
-            current_risk = max(self._directional_pnl(current_price, position.active_stop, position.direction), 0.0) * position.contract_multiplier * position.qty
-            open_risk_total += current_risk
-            by_group[position.group_name] = by_group.get(position.group_name, 0.0) + current_risk
+            principal_risk = max(
+                self._directional_pnl(
+                    position.entry_fill, position.active_stop, position.direction,
+                ),
+                0.0,
+            ) * position.contract_multiplier * position.qty
+            open_risk_total += principal_risk
+            by_group[position.group_name] = (
+                by_group.get(position.group_name, 0.0) + principal_risk
+            )
         return open_risk_total, by_group
 
     def _compute_effective_open_risk_for_entry_date(
@@ -2037,17 +2127,30 @@ class StrategyEngine:
         close_map: Dict[str, float],
         last_close_by_symbol: Dict[str, float],
     ) -> Tuple[float, Dict[str, float]]:
+        """Principal-risk projection at a candidate entry date (definition B).
+
+        Mirrors `_compute_open_risk` for live positions and adds any pending
+        entries whose entry_date ≤ candidate_entry_date (`estimated_order_risk`
+        is already the principal risk at fill).
+        """
+        del close_map
+        del last_close_by_symbol
         total = 0.0
         by_group: Dict[str, float] = {}
 
         for position in positions.values():
             if position.pending_exit_date is not None and position.pending_exit_date <= candidate_entry_date:
                 continue
-            symbol = position.symbol
-            current_price = close_map.get(symbol, last_close_by_symbol.get(symbol, position.entry_fill))
-            current_risk = max(self._directional_pnl(current_price, position.active_stop, position.direction), 0.0) * position.contract_multiplier * position.qty
-            total += current_risk
-            by_group[position.group_name] = by_group.get(position.group_name, 0.0) + current_risk
+            principal_risk = max(
+                self._directional_pnl(
+                    position.entry_fill, position.active_stop, position.direction,
+                ),
+                0.0,
+            ) * position.contract_multiplier * position.qty
+            total += principal_risk
+            by_group[position.group_name] = (
+                by_group.get(position.group_name, 0.0) + principal_risk
+            )
 
         for pending in pending_entries.values():
             if pending.entry_date <= candidate_entry_date:
@@ -2056,6 +2159,45 @@ class StrategyEngine:
                     by_group.get(pending.group_name, 0.0) + pending.estimated_order_risk
                 )
 
+        return total, by_group
+
+    def _compute_unrealized_exposure(
+        self,
+        positions: Dict[Tuple[str, str], Position],
+        close_map: Dict[str, float],
+        last_close_by_symbol: Dict[str, float],
+    ) -> Tuple[float, Dict[str, float]]:
+        """Floating-P&L exposure between current mark and active stop (legacy C).
+
+        This is the old "risk" definition that the engine used before the
+        2026-04-19 refactor. It is NOT used as a hard gate anymore; it only
+        drives the `unrealized_exposure_soft_cap` warning.
+
+            long  : max(current − active_stop, 0) × mult × qty
+            short : max(active_stop − current, 0) × mult × qty
+
+        Intuition: "how much floating profit is the stop currently
+        protecting". It grows when the stop trails into profit, so a
+        trending winner can look large here even though its principal risk
+        is zero.
+        """
+        total = 0.0
+        by_group: Dict[str, float] = {}
+        for position in positions.values():
+            symbol = position.symbol
+            current_price = close_map.get(
+                symbol, last_close_by_symbol.get(symbol, position.entry_fill),
+            )
+            exposure = max(
+                self._directional_pnl(
+                    current_price, position.active_stop, position.direction,
+                ),
+                0.0,
+            ) * position.contract_multiplier * position.qty
+            total += exposure
+            by_group[position.group_name] = (
+                by_group.get(position.group_name, 0.0) + exposure
+            )
         return total, by_group
 
     def _compute_total_notional(
@@ -2585,3 +2727,82 @@ def _jsonable(obj: Any) -> Any:
         return str(obj)
     except Exception:
         return None
+
+
+from strats.engine_prepare import (  # noqa: E402
+    _compute_data_quality_report as _prepare_compute_data_quality_report,
+    _normalize_and_validate_bars as _prepare_normalize_and_validate_bars,
+    _prepare_all_strategies as _prepare_all_strategies_impl,
+    _prepare_symbol_base as _prepare_symbol_base_impl,
+    _prepare_symbol_frame as _prepare_symbol_frame_impl,
+    _validate_input_columns as _prepare_validate_input_columns,
+    _validate_input_values as _prepare_validate_input_values,
+)
+from strats.engine_result import (  # noqa: E402
+    _build_pending_entries_df as _result_build_pending_entries_df,
+    _daily_status_columns as _result_daily_status_columns,
+    _empty_cancelled_entries_frame as _result_empty_cancelled_entries_frame,
+    _empty_open_positions_frame as _result_empty_open_positions_frame,
+    _empty_pending_entries_frame as _result_empty_pending_entries_frame,
+    _empty_trades_frame as _result_empty_trades_frame,
+    _prepared_extra_columns as _result_prepared_extra_columns,
+    _serialize_open_positions as _result_serialize_open_positions,
+)
+from strats.engine_risk import (  # noqa: E402
+    _compute_effective_open_risk_for_entry_date as _risk_compute_effective_open_risk_for_entry_date,
+    _compute_open_risk as _risk_compute_open_risk,
+    _compute_total_notional as _risk_compute_total_notional,
+    _compute_unrealized_exposure as _risk_compute_unrealized_exposure,
+    _effective_margin_rate as _risk_effective_margin_rate,
+    _months_to_delivery as _risk_months_to_delivery,
+)
+from strats.engine_runtime import run as _runtime_run  # noqa: E402
+from strats.engine_state import (  # noqa: E402
+    _INCREMENTAL_WARMUP_BARS as _STATE_INCREMENTAL_WARMUP_BARS,
+    _build_engine_state as _state_build_engine_state,
+    _build_initial_engine_state_empty as _state_build_initial_engine_state_empty,
+    _extract_warmup_bars as _state_extract_warmup_bars,
+    _merge_warmup_bars as _state_merge_warmup_bars,
+    _pending_entry_from_state_dict as _state_pending_entry_from_state_dict,
+    _pending_entry_to_state_dict as _state_pending_entry_to_state_dict,
+    _position_from_state_dict as _state_position_from_state_dict,
+    _position_to_state_dict as _state_position_to_state_dict,
+)
+
+StrategyEngine.run = _runtime_run
+
+StrategyEngine._compute_data_quality_report = _prepare_compute_data_quality_report
+StrategyEngine._normalize_and_validate_bars = _prepare_normalize_and_validate_bars
+StrategyEngine._validate_input_columns = _prepare_validate_input_columns
+StrategyEngine._validate_input_values = _prepare_validate_input_values
+StrategyEngine._prepare_symbol_base = _prepare_symbol_base_impl
+StrategyEngine._prepare_symbol_frame = _prepare_symbol_frame_impl
+StrategyEngine._prepare_all_strategies = _prepare_all_strategies_impl
+
+StrategyEngine._months_to_delivery = staticmethod(_risk_months_to_delivery)
+StrategyEngine._effective_margin_rate = _risk_effective_margin_rate
+StrategyEngine._compute_open_risk = _risk_compute_open_risk
+StrategyEngine._compute_effective_open_risk_for_entry_date = (
+    _risk_compute_effective_open_risk_for_entry_date
+)
+StrategyEngine._compute_unrealized_exposure = _risk_compute_unrealized_exposure
+StrategyEngine._compute_total_notional = _risk_compute_total_notional
+
+StrategyEngine._serialize_open_positions = _result_serialize_open_positions
+StrategyEngine._prepared_extra_columns = _result_prepared_extra_columns
+StrategyEngine._daily_status_columns = _result_daily_status_columns
+StrategyEngine._empty_trades_frame = _result_empty_trades_frame
+StrategyEngine._empty_open_positions_frame = _result_empty_open_positions_frame
+StrategyEngine._empty_cancelled_entries_frame = _result_empty_cancelled_entries_frame
+StrategyEngine._empty_pending_entries_frame = _result_empty_pending_entries_frame
+StrategyEngine._build_pending_entries_df = _result_build_pending_entries_df
+
+StrategyEngine._INCREMENTAL_WARMUP_BARS = _STATE_INCREMENTAL_WARMUP_BARS
+StrategyEngine._merge_warmup_bars = _state_merge_warmup_bars
+StrategyEngine._extract_warmup_bars = _state_extract_warmup_bars
+StrategyEngine._position_to_state_dict = _state_position_to_state_dict
+StrategyEngine._position_from_state_dict = _state_position_from_state_dict
+StrategyEngine._pending_entry_to_state_dict = _state_pending_entry_to_state_dict
+StrategyEngine._pending_entry_from_state_dict = _state_pending_entry_from_state_dict
+StrategyEngine._build_initial_engine_state_empty = _state_build_initial_engine_state_empty
+StrategyEngine._build_engine_state = _state_build_engine_state

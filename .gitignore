@@ -217,3 +217,81 @@ __marimo__/
 *.csv
 .DS_Store
 .claude/
+
+# live 运行时产物（MVP 阶段）
+live/logs/
+live/reports/
+live/signals/
+live/fills/
+# live/.env 已被上面 .env 覆盖；明确一行方便新人看
+live/.env
+
+# ---- 本地数据 / 回测产物（大文件，不入 git）----
+# data/cache/ 是 rqdata 拉的 bars / 日历 / 手续费等缓存（137 MB）
+# data/runs/ 是 Phase 0-5 pipeline 所有产物（含 _archive 历史，2.6 GB）
+# 需要在新机器重建，跑 scripts/build_enhanced_bars.py / fetch_commission_specs.py
+data/cache/
+data/runs/
+data/reports/
+
+# ---- 本地 handoff / audit / review 文档 ----
+# 这些通常是临时交接件或一次性审计输出，不作为长期源码文档维护。
+/HANDOFF_*.md
+/docs/audit_*.md
+/REPORT*.md
+/REPORT*.html
+
+# ---- 本地临时 SQL / HTML 草稿 ----
+# 正式 schema / migration / template 仍应放在受控目录并入库；
+# 这里只忽略显式带 local/tmp/scratch 后缀的临时文件。
+*.local.sql
+*.tmp.sql
+*.scratch.sql
+*.local.html
+*.tmp.html
+*.scratch.html
+
+# ---- 前端 node / next ----
+# 前端已拆到独立仓库：
+#   https://github.com/ToddyMeow/stock-future-ui
+# 后端仓禁止混入任何前端工作树；若本地临时把前端 clone 到 frontend/，直接忽略。
+frontend/
+# stock-future-ui 独立仓在此项目外，但偶尔 node_modules 出现在这里要防止误入
+node_modules/
+.next/
+.env.local
+.env.production
+
+# ---- 凭据绝对禁止入 git ----
+*.pem
+*.key
+!requirements.txt.key   # example negation if ever needed
+id_rsa*
+id_ed25519
+*.p12
+*.pfx
+*.keystore
+
+# ---- 备份 / 临时 ----
+*.bak
+*.bak.*
+*.orig
+*.rej
+*.swp
+*.swo
+*~
+
+# ---- claude/cursor 本地配置 + handoff 临时文件 ----
+.claude/
+.cursor/
+/tmp/
+# 若以后把 Codex / Claude / 其他自动化任务状态落到仓库目录，统一不入 git
+.codex/
+*.task.json
+*.task.lock
+*.heartbeat
+
+# ---- 其他可能遗漏的 OS / editor ----
+Thumbs.db
+ehthumbs.db
+desktop.ini
